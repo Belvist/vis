@@ -161,6 +161,39 @@ def test_scene_cut():
     return True
 
 
+def test_text_persistence():
+    """Test 5: Text persistence - OCR result should persist across REUSE frames"""
+    print("\n=== TEST: TEXT PERSISTENCE ===")
+    
+    config = EarAIConfig(backbone_pretrained=True)
+    ear = EarAI(config, device='cpu')
+    api = UniversalAPI(ear)
+    
+    # Create frame with text
+    frame = make_test_frame()
+    cv2.putText(frame, "HELLO WORLD", (150, 300), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    
+    # Frame 1 - should detect text
+    result1 = api.process_frame(frame, force_full=True)
+    assert result1.success
+    text1 = [tr['value'] for tr in result1.data['text']]
+    print(f"  Frame 1 text: {text1}")
+    assert any("HELLO" in t or "WORLD" in t for t in text1), f"Expected HELLO/WORLD in text, got {text1}"
+    
+    # Frames 2-5 - same frame, should REUSE and keep text
+    for i in range(2, 6):
+        result = api.process_frame(frame)
+        assert result.success, f"Frame {i} failed: {result.error}"
+        assert result.data['meta']['decision'] == 'REUSE', f"Frame {i}: expected REUSE, got {result.data['meta']['decision']}"
+        text = [tr['value'] for tr in result.data['text']]
+        print(f"  Frame {i} text: {text}")
+        # Text should persist
+        assert any("HELLO" in t or "WORLD" in t for t in text), f"Frame {i}: text not persisted, got {text}"
+    
+    print("✓ TEXT PERSISTENCE test completed")
+    return True
+
+
 def run_all_tests():
     """Run all acceptance tests"""
     print("=" * 60)
@@ -172,6 +205,7 @@ def run_all_tests():
         ("MOVING_OBJECT", test_moving_object),
         ("CAMERA_MOTION", test_camera_motion),
         ("SCENE_CUT", test_scene_cut),
+        ("TEXT_PERSISTENCE", test_text_persistence),
     ]
     
     passed = 0
