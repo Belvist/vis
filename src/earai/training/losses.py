@@ -65,9 +65,9 @@ class DistillationLoss(nn.Module):
         if 'relations' in teacher_out and 'relations' in student_out:
             losses['relation'] = self._relation_loss(teacher_out['relations'], student_out['relations'])
         
-        # 3. Segmentation loss
-        if 'segmentation' in teacher_out:
-            losses['segmentation'] = self._segmentation_loss(teacher_out['segmentation'], student_tokens)
+        # Segmentation loss - DISABLED for Gate 1 (size mismatch with 16 tokens)
+        # if 'segmentation' in teacher_out:
+        #     losses['segmentation'] = self._segmentation_loss(teacher_out['segmentation'], student_tokens)
         
         # 4. Grounding loss
         if 'grounding' in teacher_out and 'grounding' in student_out:
@@ -88,37 +88,66 @@ class DistillationLoss(nn.Module):
         """Detection distillation loss"""
         losses = {}
         
+        # COCO class mapping: teacher label -> student class index (0-79)
+        # FasterRCNN uses COCO category IDs (1-90, sparse)
+        # We map to 0-79 continuous indices
+        coco_mapping = {
+            1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6, 8: 7, 9: 8, 10: 9,
+            11: 10, 13: 11, 14: 12, 15: 13, 16: 14, 17: 15, 18: 16, 19: 17, 20: 18,
+            21: 19, 22: 20, 23: 21, 24: 22, 25: 23, 27: 24, 28: 25, 31: 26, 32: 27,
+            33: 28, 34: 29, 35: 30, 36: 31, 37: 32, 38: 33, 39: 34, 40: 35, 41: 36,
+            42: 37, 43: 38, 44: 39, 46: 40, 47: 41, 48: 42, 49: 43, 50: 44, 51: 45,
+            52: 46, 53: 47, 54: 48, 55: 49, 56: 50, 57: 51, 58: 52, 59: 53, 60: 54,
+            61: 55, 62: 56, 63: 57, 64: 58, 65: 59, 67: 60, 70: 61, 72: 62, 73: 63,
+            74: 64, 75: 65, 76: 66, 77: 67, 78: 68, 79: 69, 80: 70, 81: 71, 82: 72,
+            84: 73, 85: 74, 86: 75, 87: 76, 88: 77, 89: 78, 90: 79
+        }
+        
         # For each image in batch
-        for b, (t_det, s_out) in enumerate(zip(teacher_dets, student_out)):
-            if not t_det.get('boxes', []):
+        for b, t_det in enumerate(teacher_dets):
+            boxes = t_det.get('boxes', None)
+            if boxes is None or (hasattr(boxes, '__len__') and len(boxes) == 0):
                 continue
             
-            t_boxes = torch.tensor(t_det['boxes'], device=student_out['bboxes'].device)
-            t_labels = torch.tensor(t_det['labels'], device=student_out['class_logits'].device)
+            # Teacher boxes in pixel coordinates [x1, y1, x2, y2]
+            t_boxes = torch.tensor(boxes, dtype=torch.float32, device=student_out['bboxes_xyxy'].device)
+            t_labels_raw = torch.tensor(t_det['labels'], dtype=torch.long, device=student_out['class_logits'].device)
             
-            # Match student predictions to teacher boxes (simplified: first N predictions)
-            N_pred = student_out['bboxes'].shape[1]
-            N_gt = len(t_boxes)
+            # Map teacher labels to student class indices
+            t_labels = torch.tensor([coco_mapping.get(int(l), 0) for l in t_labels_raw], 
+                                   dtype=torch.long, device=student_out['class_logits'].device)
+            
+            # Normalize teacher boxes to 0-1 (assuming teacher boxes are in pixel coordinates)
+            # We need image size - for now assume 224x224
+            t_boxes_normalized = t_boxes.clone()
+            t_boxes_normalized[:, [0, 2]] /= 224.0  # x1, x2
+            t_boxes_normalized[:, [1, 3]] /= 224.0  # y1, y2
+            t_boxes_normalized = t_boxes_normalized.clamp(0, 1)
+            
+            # Student predictions (already normalized xyxy)
+            s_boxes = student_out['bboxes_xyxy'][b]  # [N, 4] normalized xyxy
+            s_logits = student_out['class_logits'][b]  # [N, num_classes+1]
+            s_obj = student_out['objectness'][b]  # [N]
+            
+            N_pred = s_boxes.shape[0]
+            N_gt = len(t_boxes_normalized)
             
             if N_gt == 0:
                 continue
             
-            # Bbox regression loss (L1 on matched predictions)
+            # Match student predictions to teacher boxes (simplified: first N predictions)
             matched = min(N_pred, N_gt)
             if matched > 0:
-                losses['bbox'] = F.l1_loss(
-                    student_out['bboxes'][b, :matched], t_boxes[:matched]
-                )
+                # Bbox regression loss (L1 on matched predictions, normalized xyxy)
+                losses['bbox'] = F.l1_loss(s_boxes[:matched], t_boxes_normalized[:matched])
             
             # Class loss (cross entropy on matched)
-            s_logits = student_out['class_logits'][b, :matched]
-            losses['class'] = F.cross_entropy(s_logits, t_labels[:matched])
+            s_logits_matched = s_logits[:matched]
+            losses['class'] = F.cross_entropy(s_logits_matched, t_labels[:matched])
             
             # Objectness loss
-            t_obj = torch.ones_like(student_out['objectness'][b, :matched])
-            losses['objectness'] = F.binary_cross_entropy(
-                student_out['objectness'][b, :matched], t_obj
-            )
+            t_obj = torch.ones_like(s_obj[:matched])
+            losses['objectness'] = F.binary_cross_entropy(s_obj[:matched], t_obj)
         
         return losses
     

@@ -91,12 +91,24 @@ class EarAIStudent(nn.Module):
         """
         B = x.shape[0]
         
-        # Full backbone
-        features = self.backbone(x)  # List of [B, C, H, W] at F4/F8/F16/F32
+        # Full backbone - returns dict with F4, F8, F16, F32
+        backbone_out = self.backbone(x)
+        
+        # Extract multi-scale features in correct order for TokenLearner
+        features = [
+            backbone_out["F4"],
+            backbone_out["F8"],
+            backbone_out["F16"],
+            backbone_out["F32"],
+        ]
         
         # Token learner
-        token_result = self.token_pooler(features)
-        tokens = token_result['tokens']  # [B, 16, 256]
+        token_result = self.token_pooler(features, return_attention=False)
+        # Handle both dict and tensor returns
+        if isinstance(token_result, dict):
+            tokens = token_result['tokens']
+        else:
+            tokens = token_result  # [B, 16, 256]
         
         return tokens
     

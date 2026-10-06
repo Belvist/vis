@@ -158,6 +158,21 @@ class EarAIDataset(Dataset):
         }
 
 
+def earai_collate_fn(batch):
+    """Custom collate function for variable number of boxes"""
+    images = torch.stack([b['image'] for b in batch])
+    boxes = [b['boxes'] for b in batch]
+    labels = [b['labels'] for b in batch]
+    image_ids = [b['image_id'] for b in batch]
+    
+    return {
+        'image': images,
+        'boxes': boxes,  # List of tensors [N_i, 4]
+        'labels': labels,  # List of tensors [N_i]
+        'image_id': image_ids
+    }
+
+
 class EarAITrainer:
     """
     Main training loop for EarAI.
@@ -172,11 +187,13 @@ class EarAITrainer:
                  optimizer: torch.optim.Optimizer,
                  device: str = 'cuda',
                  log_dir: str = './logs',
-                 checkpoint_dir: str = './checkpoints'):
+                 checkpoint_dir: str = './checkpoints',
+                 ocr_teacher=None):
         
         self.student = student_model.to(device)
         self.decoder = decoder.to(device)
         self.teachers = teachers.to(device) if hasattr(teachers, 'to') else teachers
+        self.ocr_teacher = ocr_teacher
         self.losses = {k: v.to(device) for k, v in losses.items()}
         self.optimizer = optimizer
         self.device = device
@@ -210,12 +227,12 @@ class EarAITrainer:
             teacher_out = self.teachers(images)
             
             # Also get OCR for text regions
-            if hasattr(self.teachers, 'ocr') and self.teachers.ocr_available:
+            if self.ocr_teacher and self.ocr_teacher.available:
                 ocr_results = []
                 for b in range(B):
                     img_np = images[b].permute(1, 2, 0).cpu().numpy()
                     img_np = (img_np * 255).astype(np.uint8)
-                    ocr_results.append(self.teachers.ocr.process(img_np))
+                    ocr_results.append(self.ocr_teacher.process(img_np))
                 teacher_out['ocr'] = ocr_results
         
         # Student forward
@@ -236,6 +253,10 @@ class EarAITrainer:
                     l = loss_fn(student_tokens.mean(1), text_emb)
                 else:
                     continue
+            elif name == 'state_transition':
+                # State transition loss - needs previous state and residual
+                # For now skip - requires streaming context
+                continue
             else:
                 continue
             
@@ -272,9 +293,10 @@ class EarAITrainer:
         pbar = tqdm(dataloader, desc=f'Epoch {self.epoch}')
         
         for batch in pbar:
-            # Collate batch
-            images = torch.stack([b['image'] for b in batch])
-            batch_dict = {'images': images}
+            # Batch is already collated by DataLoader
+            batch_dict = {
+                'images': batch['image'].to(self.device) if isinstance(batch, dict) else torch.stack([b['image'] for b in batch]).to(self.device)
+            }
             
             losses = self.train_step(batch_dict)
             
@@ -302,7 +324,7 @@ class EarAITrainer:
         
         with torch.no_grad():
             for batch in tqdm(dataloader, desc='Validation'):
-                images = torch.stack([b['image'] for b in batch]).to(self.device)
+                images = batch['image'].to(self.device) if isinstance(batch, dict) else torch.stack([b['image'] for b in batch]).to(self.device)
                 batch_dict = {'images': images}
                 
                 # Teacher forward
@@ -364,20 +386,22 @@ def create_dataloaders(config: dict) -> Tuple[DataLoader, DataLoader]:
         batch_size=config.get('batch_size', 16),
         shuffle=True,
         num_workers=config.get('num_workers', 4),
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=earai_collate_fn
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.get('batch_size', 16),
         shuffle=False,
         num_workers=config.get('num_workers', 4),
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=earai_collate_fn
     )
     
     return train_loader, val_loader
 
 
-def create_trainer(config: dict, student, decoder, teachers):
+def create_trainer(config: dict, student, decoder, teachers, ocr_teacher=None):
     """Factory for trainer"""
     # Optimizer
     optimizer = torch.optim.AdamW(
@@ -398,7 +422,8 @@ def create_trainer(config: dict, student, decoder, teachers):
         optimizer=optimizer,
         device=config.get('device', 'cuda'),
         log_dir=config.get('log_dir', './logs'),
-        checkpoint_dir=config.get('checkpoint_dir', './checkpoints')
+        checkpoint_dir=config.get('checkpoint_dir', './checkpoints'),
+        ocr_teacher=ocr_teacher
     )
     
     return trainer

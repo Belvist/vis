@@ -42,7 +42,7 @@ def main():
     
     # Create trainer
     print("Creating trainer...")
-    trainer = create_trainer(config, student, decoder, teachers)
+    trainer = create_trainer(config, student, decoder, teachers, ocr_teacher=ocr)
     
     # Resume if requested
     if args.resume:

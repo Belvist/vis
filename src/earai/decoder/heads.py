@@ -51,7 +51,7 @@ class ObjectDecoder(nn.Module):
     def forward(self, tokens: torch.Tensor) -> Dict:
         """
         tokens: [B, N, D] visual tokens
-        Returns: dict with class_logits, bboxes, objectness
+        Returns: dict with class_logits, bboxes, objectness, and detections (for loss compatibility)
         """
         B, N, D = tokens.shape
         
@@ -63,13 +63,33 @@ class ObjectDecoder(nn.Module):
         
         # Predictions
         class_logits = self.class_head(queries)      # [B, N, num_classes+1]
-        bboxes = torch.sigmoid(self.bbox_head(queries))  # [B, N, 4] normalized
+        bboxes_cxcywh = torch.sigmoid(self.bbox_head(queries))  # [B, N, 4] normalized [cx, cy, w, h]
         objectness = self.obj_head(queries).squeeze(-1)  # [B, N]
+        
+        # Convert to normalized xyxy for loss compatibility
+        cx, cy, w, h = bboxes_cxcywh.unbind(-1)
+        x1 = cx - w / 2
+        y1 = cy - h / 2
+        x2 = cx + w / 2
+        y2 = cy + h / 2
+        bboxes_xyxy = torch.stack([x1, y1, x2, y2], dim=-1).clamp(0, 1)
+        
+        # Detections format for loss (normalized xyxy)
+        detections = []
+        for b in range(B):
+            det = {
+                'boxes': bboxes_xyxy[b].detach().cpu().numpy(),  # [N, 4] normalized xyxy
+                'scores': objectness[b].detach().cpu().numpy(),
+                'labels': class_logits[b].argmax(-1).detach().cpu().numpy()  # [N]
+            }
+            detections.append(det)
         
         return {
             'class_logits': class_logits,
-            'bboxes': bboxes,           # [cx, cy, w, h] normalized
+            'bboxes': bboxes_cxcywh,           # [cx, cy, w, h] normalized
+            'bboxes_xyxy': bboxes_xyxy,        # [x1, y1, x2, y2] normalized
             'objectness': objectness,
+            'detections': detections,          # For loss compatibility
         }
 
 
@@ -281,7 +301,9 @@ class EarAIDecoder(nn.Module):
         return {
             'class_logits': obj_out['class_logits'],
             'bboxes': obj_out['bboxes'],
+            'bboxes_xyxy': obj_out['bboxes_xyxy'],
             'objectness': obj_out['objectness'],
+            'detections': obj_out['detections'],
             'relations': relations,
             'grounding': grounding,
         }
