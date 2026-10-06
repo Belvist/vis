@@ -13,7 +13,7 @@ class EarAIConfig:
     backbone: str = "mobilenetv3_small"
     backbone_pretrained: bool = True
     backbone_width_mult: float = 1.0
-    feature_dim: int = 576  # MobileNetV3-Small last layer
+    feature_dim: int = 256  # Common dimension for all heads
 
     # Heads (lightweight)
     object_head_dim: int = 128

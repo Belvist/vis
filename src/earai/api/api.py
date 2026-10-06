@@ -38,6 +38,7 @@ class UniversalAPI:
             data["meta"] = {
                 "frame_id": result.packet.frame_id,
                 "inference_mode": result.mode,
+                "decision": result.decision,
                 "processing_time_ms": round(result.packet.processing_time_ms, 1),
                 "timestamp": result.packet.t
             }
@@ -103,6 +104,7 @@ class NativeAPI:
             data["meta"] = {
                 "frame_id": result.packet.frame_id,
                 "inference_mode": result.mode,
+                "decision": result.decision,
                 "processing_time_ms": round(result.packet.processing_time_ms, 1),
                 "timestamp": result.packet.t
             }
