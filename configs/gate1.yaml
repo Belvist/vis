@@ -20,7 +20,7 @@ epochs: 100
 eval_every: 10
 
 # Data - MUST have COCO at this path
-data_root: "./data/coco"
+data_root: "./data/coco/annotations"
 coco_split: "val2017"
 
 # Device
