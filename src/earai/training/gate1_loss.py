@@ -46,7 +46,14 @@ def generalized_box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Ten
     
     area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])  # [N]
     area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])  # [M]
-    union = area1[:, None] + area2[None, :] - (iou * (area1[:, None] + area2[None, :] - 1e-6))
+    
+    # Intersection (recompute to avoid numerical issues)
+    inter_lt = torch.max(boxes1[:, None, :2], boxes2[None, :, :2])
+    inter_rb = torch.min(boxes1[:, None, 2:], boxes2[None, :, 2:])
+    inter_wh = (inter_rb - inter_lt).clamp(min=0)
+    inter = inter_wh[:, :, 0] * inter_wh[:, :, 1]
+    
+    union = area1[:, None] + area2[None, :] - inter  # [N, M]
     
     giou = iou - (area_c - union) / (area_c + 1e-6)
     return giou
@@ -221,9 +228,10 @@ class Gate1Loss(nn.Module):
             # Bbox L1 loss
             loss_bbox += F.l1_loss(pred_boxes_matched, target_boxes)
             
-            # GIoU loss
-            giou = generalized_box_iou(pred_boxes_matched, target_boxes)
-            loss_giou += (1 - giou).mean()
+            # GIoU loss - only on matched pairs (diagonal)
+            giou_matrix = generalized_box_iou(pred_boxes_matched, target_boxes)  # [M, M]
+            giou_diag = torch.diag(giou_matrix)  # [M]
+            loss_giou += (1 - giou_diag).mean()
             
             # Objectness loss (matched = 1)
             loss_objectness += F.binary_cross_entropy(

@@ -14,11 +14,18 @@ dependencies = [
     "opencv-python>=4.8",
     "numpy>=1.24",
     "pytesseract>=0.3.10",
+    "pyyaml>=6.0",
+    "tqdm>=4.65",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest", "mss"]
 screen = ["mss"]
+gate1 = [
+    "scipy>=1.10",
+    "pycocotools>=2.0",
+    "git+https://github.com/openai/CLIP.git",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

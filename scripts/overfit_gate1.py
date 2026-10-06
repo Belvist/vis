@@ -8,93 +8,12 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 from typing import Dict, List
-import sys
-
-sys.path.insert(0, '/Users/earflow/earai/src')
 
 from earai.training.student import create_student_model
 from earai.training.gate1_teachers import create_gate1_teachers
 from earai.training.gate1_loss import create_gate1_loss
 from earai.training.gate1_dataset import create_gate1_dataloader
 from earai.decoder.heads import create_decoder
-
-
-def compute_metrics(pred_boxes: torch.Tensor, pred_labels: torch.Tensor, pred_obj: torch.Tensor,
-                   target_boxes: List[torch.Tensor], target_labels: List[torch.Tensor],
-                   threshold: float = 0.5) -> Dict:
-    """Compute IoU, class accuracy, objectness accuracy"""
-    
-    all_ious = []
-    correct_class = 0
-    total_class = 0
-    correct_obj = 0
-    total_obj = 0
-    
-    for b in range(len(target_boxes)):
-        if len(target_boxes[b]) == 0:
-            # No GT objects - all predictions should be background
-            pred_obj_b = pred_obj[b]
-            correct_obj += (pred_obj_b < threshold).sum().item()
-            total_obj += len(pred_obj_b)
-            continue
-        
-        # Get predictions above threshold
-        pred_mask = pred_obj[b] >= threshold
-        pred_boxes_b = pred_boxes[b][pred_mask]
-        pred_labels_b = pred_labels[b][pred_mask]
-        pred_obj_b = pred_obj[b][pred_mask]
-        
-        if len(pred_boxes_b) == 0:
-            # No predictions above threshold
-            total_obj += len(target_boxes[b])
-            continue
-        
-        # IoU with Hungarian matching
-        from scipy.optimize import linear_sum_assignment
-        
-        ious = box_iou(pred_boxes_b, target_boxes[b])  # [P, G]
-        ious_np = ious.detach().cpu().numpy()
-        
-        # Hungarian assignment
-        cost = -ious_np
-        pred_idx, target_idx = linear_sum_assignment(cost)
-        
-        # Matched pairs
-        for p_idx, t_idx in zip(pred_idx, target_idx):
-            if p_idx < len(pred_boxes_b) and t_idx < len(target_boxes[b]):
-                iou = ious[p_idx, t_idx].item()
-                all_ious.append(iou)
-                
-                # Class accuracy
-                if pred_labels_b[p_idx].item() == target_labels[b][t_idx].item():
-                    correct_class += 1
-                total_class += 1
-        
-        # Unmatched predictions = false positives
-        matched_pred = set(pred_idx)
-        for i in range(len(pred_boxes_b)):
-            if i not in matched_pred:
-                total_obj += 1  # False positive
-        
-        # Unmatched targets = false negatives
-        matched_target = set(target_idx)
-        for i in range(len(target_boxes[b])):
-            if i not in matched_target:
-                total_obj += 1  # False negative
-        
-        # Matched = true positives
-        correct_obj += len(matched_pred)
-    
-    mean_iou = np.mean(all_ious) if all_ious else 0.0
-    class_acc = correct_class / max(total_class, 1)
-    obj_acc = correct_obj / max(total_obj, 1)
-    
-    return {
-        'mean_iou': float(mean_iou),
-        'class_accuracy': float(class_acc),
-        'objectness_accuracy': float(obj_acc),
-        'num_matched': len(all_ious)
-    }
 
 
 def box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
@@ -109,6 +28,96 @@ def box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
     union = area1[:, None] + area2[None, :] - inter
     
     return inter / (union + 1e-6)
+
+
+def compute_metrics(pred_boxes: torch.Tensor, pred_labels: torch.Tensor, pred_obj: torch.Tensor,
+                   target_boxes: List[torch.Tensor], target_labels: List[torch.Tensor],
+                   threshold: float = 0.5) -> Dict:
+    """
+    Compute precision, recall, F1, mean IoU, class accuracy
+    """
+    all_ious = []
+    tp = 0
+    fp = 0
+    fn = 0
+    correct_class = 0
+    total_class = 0
+    
+    for b in range(len(target_boxes)):
+        gt_boxes = target_boxes[b]
+        gt_labels = target_labels[b]
+        num_gt = len(gt_boxes)
+        
+        # Get predictions above threshold
+        pred_mask = pred_obj[b] >= threshold
+        pred_boxes_b = pred_boxes[b][pred_mask]
+        pred_labels_b = pred_labels[b][pred_mask]
+        pred_obj_b = pred_obj[b][pred_mask]
+        num_pred = len(pred_boxes_b)
+        
+        if num_gt == 0:
+            # No GT objects - all predictions are FP
+            fp += num_pred
+            continue
+        
+        if num_pred == 0:
+            # No predictions - all GT are FN
+            fn += num_gt
+            continue
+        
+        # IoU matrix
+        ious = box_iou(pred_boxes_b, gt_boxes)  # [P, G]
+        ious_np = ious.detach().cpu().numpy()
+        
+        # Hungarian assignment
+        from scipy.optimize import linear_sum_assignment
+        cost = -ious_np
+        pred_idx, target_idx = linear_sum_assignment(cost)
+        
+        matched_gt = set()
+        matched_pred = set()
+        
+        for p_idx, t_idx in zip(pred_idx, target_idx):
+            if p_idx < num_pred and t_idx < num_gt:
+                iou = ious[p_idx, t_idx].item()
+                # Only count as TP if IoU >= 0.5
+                if iou >= 0.5:
+                    tp += 1
+                    all_ious.append(iou)
+                    matched_gt.add(t_idx)
+                    matched_pred.add(p_idx)
+                    
+                    # Class accuracy on matched
+                    if pred_labels_b[p_idx].item() == gt_labels[t_idx].item():
+                        correct_class += 1
+                    total_class += 1
+                else:
+                    # Low IoU = FP + FN
+                    fp += 1
+                    fn += 1
+        
+        # Unmatched predictions = FP
+        fp += num_pred - len(matched_pred)
+        # Unmatched GT = FN
+        fn += num_gt - len(matched_gt)
+    
+    # Compute metrics
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    f1 = 2 * precision * recall / max(precision + recall, 1e-6)
+    mean_iou = np.mean(all_ious) if all_ious else 0.0
+    class_acc = correct_class / max(total_class, 1)
+    
+    return {
+        'mean_iou': float(mean_iou),
+        'precision': float(precision),
+        'recall': float(recall),
+        'f1': float(f1),
+        'class_accuracy': float(class_acc),
+        'tp': tp,
+        'fp': fp,
+        'fn': fn
+    }
 
 
 class Gate1Trainer:
@@ -151,6 +160,8 @@ class Gate1Trainer:
         # Metrics tracking
         self.history = []
         self.initial_loss = None
+        self.best_f1 = 0
+        self.best_state = None
     
     def train_step(self, batch: Dict) -> Dict:
         """Single training step"""
@@ -188,7 +199,7 @@ class Gate1Trainer:
         return {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in losses.items()}
     
     @torch.no_grad()
-    def evaluate(self) -> Dict:
+    def evaluate(self, save_predictions: bool = False) -> Dict:
         """Evaluate on training set (overfit test)"""
         self.student.eval()
         self.decoder.eval()
@@ -198,6 +209,9 @@ class Gate1Trainer:
         all_pred_obj = []
         all_target_boxes = []
         all_target_labels = []
+        all_image_ids = []
+        
+        predictions_list = []
         
         for batch in self.train_loader:
             student_imgs = batch['student'].to(self.device)
@@ -225,6 +239,39 @@ class Gate1Trainer:
             all_pred_obj.append(pred_obj)
             all_target_boxes.extend(target_boxes)
             all_target_labels.extend(target_labels)
+            all_image_ids.extend(batch['image_ids'])
+            
+            if save_predictions:
+                # Collect predictions for JSON
+                for i in range(len(batch['image_ids'])):
+                    img_id = batch['image_ids'][i]
+                    
+                    # Teacher detections
+                    teacher_det = teacher_out['detections'][i]
+                    teacher_objects = []
+                    for box, label, score in zip(teacher_det['boxes'], teacher_det['labels'], teacher_det['scores']):
+                        if score >= 0.7:
+                            teacher_objects.append({
+                                'class': COCO_CATEGORIES[label] if label < len(COCO_CATEGORIES) else 'unknown',
+                                'bbox': box.tolist(),
+                                'confidence': float(score)
+                            })
+                    
+                    # EarAI predictions (threshold 0.5)
+                    pred_mask = pred_obj[i] >= 0.5
+                    earai_objects = []
+                    for box, label, obj_score in zip(pred_boxes[i][pred_mask], pred_labels[i][pred_mask], pred_obj[i][pred_mask]):
+                        earai_objects.append({
+                            'class': COCO_CATEGORIES[label.item()] if label.item() < len(COCO_CATEGORIES) else 'unknown',
+                            'bbox': box.tolist(),
+                            'confidence': float(obj_score.item())
+                        })
+                    
+                    predictions_list.append({
+                        'image_id': int(img_id),
+                        'teacher': teacher_objects,
+                        'earai': earai_objects
+                    })
         
         # Concat all predictions
         all_pred_boxes = torch.cat(all_pred_boxes, dim=0)
@@ -236,6 +283,9 @@ class Gate1Trainer:
             all_pred_boxes, all_pred_labels, all_pred_obj,
             all_target_boxes, all_target_labels
         )
+        
+        if save_predictions:
+            return metrics, predictions_list
         
         return metrics
     
@@ -257,6 +307,26 @@ class Gate1Trainer:
         
         self.history.append(avg_losses)
         return avg_losses
+    
+    def save_checkpoint(self, path: str):
+        """Save model checkpoint"""
+        torch.save({
+            'student_state': self.student.state_dict(),
+            'decoder_state': self.decoder.state_dict(),
+            'loss_fn_state': self.loss_fn.state_dict(),
+            'optimizer_state': self.optimizer.state_dict(),
+            'config': self.config,
+            'history': self.history
+        }, path)
+    
+    def load_checkpoint(self, path: str):
+        """Load model checkpoint"""
+        ckpt = torch.load(path, map_location=self.device)
+        self.student.load_state_dict(ckpt['student_state'])
+        self.decoder.load_state_dict(ckpt['decoder_state'])
+        self.loss_fn.load_state_dict(ckpt['loss_fn_state'])
+        self.optimizer.load_state_dict(ckpt['optimizer_state'])
+        self.history = ckpt.get('history', [])
 
 
 def run_gate1_overfit(config: dict, device: str = 'cpu') -> Dict:
@@ -267,16 +337,13 @@ def run_gate1_overfit(config: dict, device: str = 'cpu') -> Dict:
     print("=" * 60)
     print(f"Device: {device}")
     print(f"Epochs: {config.get('epochs', 100)}")
-    print(f"Batch size: {config.get('batch_size', 16)}")
+    print(f"Batch size: {config.get('batch_size', 8)}")
     print()
     
     trainer = Gate1Trainer(config, device)
     
     epochs = config.get('epochs', 100)
     eval_every = config.get('eval_every', 10)
-    
-    best_iou = 0
-    final_metrics = None
     
     for epoch in range(epochs):
         # Train
@@ -288,29 +355,39 @@ def run_gate1_overfit(config: dict, device: str = 'cpu') -> Dict:
             print("Evaluating...")
             metrics = trainer.evaluate()
             print(f"  Mean IoU: {metrics['mean_iou']:.4f}")
+            print(f"  Precision: {metrics['precision']:.4f}")
+            print(f"  Recall: {metrics['recall']:.4f}")
+            print(f"  F1: {metrics['f1']:.4f}")
             print(f"  Class Acc: {metrics['class_accuracy']:.4f}")
-            print(f"  Obj Acc: {metrics['objectness_accuracy']:.4f}")
             
-            if metrics['mean_iou'] > best_iou:
-                best_iou = metrics['mean_iou']
-            final_metrics = metrics
+            if metrics['f1'] > trainer.best_f1:
+                trainer.best_f1 = metrics['f1']
+                trainer.best_state = {
+                    'student': trainer.student.state_dict(),
+                    'decoder': trainer.decoder.state_dict(),
+                    'loss_fn': trainer.loss_fn.state_dict(),
+                    'optimizer': trainer.optimizer.state_dict()
+                }
     
-    # Final evaluation
+    # Final evaluation with predictions
     print("\n" + "=" * 60)
     print("FINAL EVALUATION")
     print("=" * 60)
-    final_metrics = trainer.evaluate()
+    final_metrics, predictions = trainer.evaluate(save_predictions=True)
     print(f"Initial Loss: {trainer.initial_loss:.4f}")
     print(f"Final Loss: {trainer.history[-1]['total']:.4f}")
     print(f"Mean IoU: {final_metrics['mean_iou']:.4f}")
+    print(f"Precision: {final_metrics['precision']:.4f}")
+    print(f"Recall: {final_metrics['recall']:.4f}")
+    print(f"F1: {final_metrics['f1']:.4f}")
     print(f"Class Accuracy: {final_metrics['class_accuracy']:.4f}")
-    print(f"Objectness Accuracy: {final_metrics['objectness_accuracy']:.4f}")
     
-    # PASS/FAIL criteria
+    # PASS/FAIL criteria (updated)
     pass_gate = (
         final_metrics['mean_iou'] >= 0.70 and
         final_metrics['class_accuracy'] >= 0.90 and
-        final_metrics['objectness_accuracy'] >= 0.95
+        final_metrics['precision'] >= 0.90 and
+        final_metrics['recall'] >= 0.90
     )
     
     result = {
@@ -318,33 +395,54 @@ def run_gate1_overfit(config: dict, device: str = 'cpu') -> Dict:
         'final_loss': trainer.history[-1]['total'],
         'mean_iou': final_metrics['mean_iou'],
         'class_accuracy': final_metrics['class_accuracy'],
-        'objectness_accuracy': final_metrics['objectness_accuracy'],
+        'precision': final_metrics['precision'],
+        'recall': final_metrics['recall'],
+        'f1': final_metrics['f1'],
         'steps': len(trainer.history) * len(trainer.train_loader),
         'epochs': epochs,
         'PASS': pass_gate
     }
     
-    # Save report
+    # Save artifacts
     artifacts_dir = Path('artifacts')
     artifacts_dir.mkdir(exist_ok=True)
     
     with open(artifacts_dir / 'gate1_report.json', 'w') as f:
         json.dump(result, f, indent=2)
     
-    # Save predictions for inspection
-    # (would need one more forward pass to collect)
+    with open(artifacts_dir / 'gate1_predictions.json', 'w') as f:
+        json.dump(predictions, f, indent=2)
+    
+    # Save best checkpoint
+    if trainer.best_state:
+        torch.save(trainer.best_state, artifacts_dir / 'gate1_best.pt')
     
     print(f"\nResult: {'PASS ✓' if pass_gate else 'FAIL ✗'}")
     print(f"Report saved to: {artifacts_dir / 'gate1_report.json'}")
+    print(f"Predictions saved to: {artifacts_dir / 'gate1_predictions.json'}")
+    print(f"Best checkpoint saved to: {artifacts_dir / 'gate1_best.pt'}")
     
     return result
+
+
+# COCO categories for prediction saving
+COCO_CATEGORIES = [
+    'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat', 'traffic light',
+    'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow',
+    'elephant', 'bear', 'zebra', 'giraffe', 'backpack', 'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee',
+    'skis', 'snowboard', 'sports ball', 'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket', 'bottle',
+    'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple', 'sandwich', 'orange',
+    'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch', 'potted plant', 'bed',
+    'dining table', 'toilet', 'tv', 'laptop', 'mouse', 'remote', 'keyboard', 'cell phone', 'microwave', 'oven',
+    'toaster', 'sink', 'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
+]
 
 
 if __name__ == '__main__':
     import argparse
     
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='configs/train.yaml')
+    parser.add_argument('--config', type=str, default='configs/gate1.yaml')
     parser.add_argument('--device', type=str, default='cpu')
     parser.add_argument('--epochs', type=int, default=100)
     args = parser.parse_args()
@@ -365,4 +463,6 @@ if __name__ == '__main__':
     for k, v in result.items():
         print(f"  {k}: {v}")
     print(f"  gate1_report.json: artifacts/gate1_report.json")
+    print(f"  gate1_predictions.json: artifacts/gate1_predictions.json")
+    print(f"  gate1_best.pt: artifacts/gate1_best.pt")
     print("=" * 60)
