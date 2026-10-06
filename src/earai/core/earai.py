@@ -367,7 +367,7 @@ class EarAI:
                 updated_tokens = self.state_updater(
                     predicted_state=prev_tokens,
                     delta_features=delta_features,
-                    delta_bboxes=torch.tensor([r.bbox for r in rois], device=self.device).unsqueeze(0) if rois else torch.zeros((1, 0, 4), device=self.device),
+                    delta_bboxes=torch.tensor(np.array([r.bbox for r in rois]), device=self.device).unsqueeze(0) if rois else torch.zeros((1, 0, 4), device=self.device),
                     state_bboxes=prev_bboxes
                 )
         else:
