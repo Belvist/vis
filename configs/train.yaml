@@ -1,0 +1,49 @@
+# EarAI Training Configuration
+# Target: 3-8 MB INT8 model
+
+# Model configuration
+feature_dim: 256
+num_scene_tokens: 16
+num_classes: 80  # COCO classes
+num_relations: 8
+vocab_size: 5000
+
+# Backbone
+backbone_pretrained: true
+peripheral_resolution: [224, 224]
+fovea_resolution: [600, 600]
+max_entities: 100
+
+# Training
+batch_size: 16
+num_workers: 4
+lr: 1e-4
+weight_decay: 1e-4
+epochs: 100
+
+# Loss weights
+losses:
+  distillation:
+    lambda_obj: 1.0
+    lambda_bbox: 2.0
+    lambda_class: 1.0
+    lambda_rel: 0.5
+    lambda_text: 1.0
+    lambda_grounding: 1.0
+    lambda_clip: 1.0
+    lambda_seg: 0.5
+  contrastive:
+    temperature: 0.07
+  state_transition:
+    lambda_state: 1.0
+    lambda_uncertainty: 0.5
+
+# Data
+data_root: "./data/coco"  # Change to your dataset path
+
+# Logging
+log_dir: "./logs/earai"
+checkpoint_dir: "./checkpoints/earai"
+
+# Device
+device: "cuda"
