@@ -156,13 +156,13 @@ class ROIExtractor:
         
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if area < 50:  # Min area
+            if area < 200:  # Increased min area to filter noise
                 continue
             x, y, bw, bh = cv2.boundingRect(cnt)
             
-            # Add context margin
-            margin_w = int(bw * self.context_margin)
-            margin_h = int(bh * self.context_margin)
+            # Smaller context margin
+            margin_w = int(bw * 0.1)
+            margin_h = int(bh * 0.1)
             x1 = max(0, x - margin_w) / w
             y1 = max(0, y - margin_h) / h
             x2 = min(w, x + bw + margin_w) / w
