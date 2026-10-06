@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Vera Eye Demo - Visual coprocessor 3-8 MB
+EarAI Demo - Visual coprocessor 3-8 MB
 Shows universal API (JSON for any LLM) and native API (embeddings)
 """
 import sys
@@ -8,10 +8,10 @@ import time
 import cv2
 import numpy as np
 
-sys.path.insert(0, '/Users/earflow/vera-eye')
+sys.path.insert(0, '/Users/earflow/earai')
 
-from vera_eye import (
-    VeraEye, VeraEyeConfig, create_vera_eye,
+from earai import (
+    EarAI, EarAIConfig, create_earai,
     UniversalAPI, NativeAPI, StreamingAPI,
     VisionPacket
 )
@@ -23,8 +23,8 @@ def demo_universal_api():
     print("DEMO: Universal API (JSON for any LLM)")
     print("="*60)
 
-    config = VeraEyeConfig()
-    vera = create_vera_eye(config, device="cpu")
+    config = EarAIConfig()
+    vera = create_earai(config, device="cpu")
     api = UniversalAPI(vera)
 
     # Create test frame
@@ -65,8 +65,8 @@ def demo_native_api():
     print("DEMO: Native API (Embeddings for trained models)")
     print("="*60)
 
-    config = VeraEyeConfig()
-    vera = create_vera_eye(config, device="cpu")
+    config = EarAIConfig()
+    vera = create_earai(config, device="cpu")
     api = NativeAPI(vera)
 
     frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
@@ -101,7 +101,7 @@ def demo_streaming():
     print("DEMO: Streaming API (simulated)")
     print("="*60)
 
-    config = VeraEyeConfig()
+    config = EarAIConfig()
     frames_processed = []
 
     def on_frame(data):
@@ -116,7 +116,7 @@ def demo_streaming():
         frame = np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
         if i == 2:
             cv2.rectangle(frame, (200, 200), (400, 400), (255, 255, 0), -1)
-        streaming.vera_eye.process_frame(frame)
+        streaming.earai.process_frame(frame)
 
     print(f"\n  Processed {len(frames_processed)} frames")
 
@@ -127,8 +127,8 @@ def demo_persistent_memory():
     print("DEMO: Persistent Scene Memory (World State)")
     print("="*60)
 
-    config = VeraEyeConfig()
-    vera = create_vera_eye(config, device="cpu")
+    config = EarAIConfig()
+    vera = create_earai(config, device="cpu")
 
     # Frame 1: Object appears
     frame1 = np.zeros((480, 640, 3), dtype=np.uint8)
@@ -173,8 +173,8 @@ def demo_foveated_vision():
     print("DEMO: Foveated Vision")
     print("="*60)
 
-    config = VeraEyeConfig()
-    vera = create_vera_eye(config, device="cpu")
+    config = EarAIConfig()
+    vera = create_earai(config, device="cpu")
 
     # Large frame with small text region
     frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
@@ -206,8 +206,8 @@ def demo_size_report():
     print("MODEL SIZE REPORT")
     print("="*60)
 
-    config = VeraEyeConfig()
-    vera = create_vera_eye(config, device="cpu")
+    config = EarAIConfig()
+    vera = create_earai(config, device="cpu")
 
     backbone_params = sum(p.numel() for p in vera.backbone.parameters())
     heads_params = sum(
