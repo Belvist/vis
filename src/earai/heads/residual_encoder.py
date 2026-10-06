@@ -148,10 +148,11 @@ class ROIExtractor:
         return rois
     
     def _extract_change_rois(self, change_map: np.ndarray, w: int, h: int) -> List[ResidualROI]:
-        """Extract ROIs from binary change map"""
+        """Extract ROIs from binary change map (already 0/255 uint8)"""
         rois = []
         # Find connected components
-        change_uint8 = (change_map * 255).astype(np.uint8)
+        # change_map is already 0/255 uint8 from compute_residual_frame
+        change_uint8 = change_map.astype(np.uint8)
         contours, _ = cv2.findContours(change_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         for cnt in contours:

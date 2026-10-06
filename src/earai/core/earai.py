@@ -196,14 +196,15 @@ class EarAI:
             # Fallback: treat as keyframe
             return self._keyframe_inference(frame)
         
-        # 2. Warp previous frame
-        if self.prev_frame is not None:
-            self.prev_frame_warped, _ = warp_frame(self.prev_frame, motion)
+        # 3. Compute residual with valid mask
+        if self.prev_frame is not None and motion is not None:
+            self.prev_frame_warped, valid_mask = warp_frame(self.prev_frame, motion)
         else:
             self.prev_frame_warped = frame.copy()
+            valid_mask = np.ones(frame.shape[:2], dtype=np.uint8)
         
-        # 3. Compute residual
-        residual_map, binary_mask = compute_residual_frame(frame, self.prev_frame_warped)
+        # 3. Compute residual with valid mask
+        residual_map, binary_mask = compute_residual_frame(frame, self.prev_frame_warped, valid_mask)
         residual_magnitude = float(residual_map.mean())
         
         # 4. Extract ROIs
