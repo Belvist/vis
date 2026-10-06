@@ -11,6 +11,7 @@ class VisualState:
     """Persistent visual state"""
     scene_tokens: torch.Tensor      # [B, num_scene_tokens, D]
     token_centroids: torch.Tensor   # [B, num_scene_tokens, 2] normalized [0,1]
+    text_regions: list              # List of TextRegion objects
     region_tokens: torch.Tensor     # [B, num_region_tokens, D] (variable)
     region_bboxes: torch.Tensor     # [B, num_region_tokens, 4] normalized
     entity_tracks: dict             # Tracked entities with IDs

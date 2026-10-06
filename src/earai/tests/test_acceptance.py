@@ -113,13 +113,14 @@ def test_camera_motion():
     assert result.data['meta']['decision'] == 'KEYFRAME'
     
     # Frames 2-4: camera pan
-        for i in range(2, 5):
-            f = frame.copy()
-            M = np.array([[1.0, 0.0, float(i*5)], [0.0, 1.0, float(i*3)]], dtype=np.float32)
-            f = cv2.warpAffine(f, M, (frame.shape[1], frame.shape[0]))
-            result = api.process_frame(f)
-            assert result.success, f"Frame {i} failed: {result.error}"
-            print(f"  Frame {i}: {result.data['meta']['decision']} (entities: {len(result.data['entities'])})")
+    for i in range(2, 5):
+        f = frame.copy()
+        M = np.array([[1.0, 0.0, float(i*5)], [0.0, 1.0, float(i*3)]], dtype=np.float32)
+        f = cv2.warpAffine(f, M, (frame.shape[1], frame.shape[0]))
+        result = api.process_frame(f)
+        assert result.success, f"Frame {i} failed: {result.error}"
+        assert result.data['meta']['decision'] == 'REUSE', f"Frame {i}: expected REUSE, got {result.data['meta']['decision']}"
+        print(f"  Frame {i}: {result.data['meta']['decision']} (entities: {len(result.data['entities'])})")
     
     print("✓ CAMERA MOTION test completed")
     return True

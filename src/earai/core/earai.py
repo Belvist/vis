@@ -80,7 +80,8 @@ class EarAI:
         # Motion compensation
         self.motion_estimator = MotionEstimator(
             downsample=4,
-            max_features=200
+            max_features=200,
+            min_features=10
         )
         
         # Residual encoder
@@ -315,6 +316,7 @@ class EarAI:
         state = VisualState(
             scene_tokens=torch.from_numpy(scene_tokens.cpu().numpy().squeeze(0)),
             token_centroids=torch.from_numpy(token_centroids),
+            text_regions=text_regions,
             region_tokens=torch.zeros((0, self.config.feature_dim)),
             region_bboxes=torch.zeros((0, 4)),
             entity_tracks={},
@@ -442,10 +444,25 @@ class EarAI:
             if self.prev_state is not None:
                 updated_centroids = self.prev_state.token_centroids.cpu().numpy()
         
+        # Warp text_regions with motion
+        updated_text_regions = []
+        if self.prev_state is not None and motion is not None:
+            for tr in self.prev_state.text_regions:
+                warped_bbox = motion.warp_bbox(np.array([tr.bbox.x1, tr.bbox.y1, tr.bbox.x2, tr.bbox.y2]))
+                updated_text_regions.append(TextRegion(
+                    value=tr.value,
+                    bbox=BBox(*warped_bbox),
+                    confidence=tr.confidence,
+                    language=tr.language
+                ))
+        else:
+            updated_text_regions = self.prev_state.text_regions if self.prev_state else []
+        
         # 10. Update state
         new_state = VisualState(
             scene_tokens=torch.from_numpy(updated_tokens.cpu().numpy().squeeze(0)),
             token_centroids=torch.from_numpy(updated_centroids),
+            text_regions=updated_text_regions,
             region_tokens=torch.zeros((0, self.config.feature_dim)),
             region_bboxes=torch.from_numpy(np.array([r.bbox for r in rois]) if rois else np.zeros((0, 4))),
             entity_tracks={e.id: e for e in packet.entities},
@@ -477,55 +494,69 @@ class EarAI:
         )
     
     def _reuse_inference(self, frame: np.ndarray, motion) -> InferenceResult:
-        """Fast path: reuse previous state with motion compensation"""
-        start = time.time()
+            """Fast path: reuse previous state with motion compensation"""
+            start = time.time()
         
-        # Warp visual state (tokens + centroids) with motion
-        if self.prev_state is not None:
-            # Warp token centroids
-            prev_centroids = self.prev_state.token_centroids.clone()
-            warped_centroids = torch.zeros_like(prev_centroids)
-            for i in range(len(prev_centroids)):
-                cx, cy = prev_centroids[i]
-                cx_new = cx * motion.matrix[0,0] + cy * motion.matrix[0,1] + motion.translation[0]
-                cy_new = cx * motion.matrix[1,0] + cy * motion.matrix[1,1] + motion.translation[1]
-                warped_centroids[i] = torch.tensor([cx_new, cy_new])
+            # Warp visual state (tokens + centroids + text_regions) with motion
+            if self.prev_state is not None:
+                # Warp token centroids
+                prev_centroids = self.prev_state.token_centroids.clone()
+                warped_centroids = torch.zeros_like(prev_centroids)
+                for i in range(len(prev_centroids)):
+                    cx, cy = prev_centroids[i]
+                    cx_new = cx * motion.matrix[0,0] + cy * motion.matrix[0,1] + motion.translation[0]
+                    cy_new = cx * motion.matrix[1,0] + cy * motion.matrix[1,1] + motion.translation[1]
+                    warped_centroids[i] = torch.tensor([cx_new, cy_new])
             
-            # Update entity positions with motion
-            entities = []
-            for entity in self.scene_memory.entities.values():
-                e = entity.entity
-                warped_bbox = motion.warp_bbox(np.array([e.bbox.x1, e.bbox.y1, e.bbox.x2, e.bbox.y2]))
-                e.bbox = BBox(*warped_bbox)
-                entities.append(e)
+                # Warp text regions
+                warped_text_regions = []
+                for tr in self.prev_state.text_regions:
+                    warped_bbox = motion.warp_bbox(np.array([tr.bbox.x1, tr.bbox.y1, tr.bbox.x2, tr.bbox.y2]))
+                    warped_text_regions.append(TextRegion(
+                        value=tr.value,
+                        bbox=BBox(*warped_bbox),
+                        confidence=tr.confidence,
+                        language=tr.language
+                    ))
             
-            # Update state with warped centroids (semantic tokens unchanged)
-            self.prev_state.token_centroids = warped_centroids
-        else:
-            entities = []
+                # Update entity positions with motion
+                entities = []
+                for entity in self.scene_memory.entities.values():
+                    e = entity.entity
+                    warped_bbox = motion.warp_bbox(np.array([e.bbox.x1, e.bbox.y1, e.bbox.x2, e.bbox.y2]))
+                    e.bbox = BBox(*warped_bbox)
+                    entities.append(e)
+            
+                # Update state with warped centroids and text_regions (semantic tokens unchanged)
+                self.prev_state.token_centroids = warped_centroids
+                self.prev_state.text_regions = warped_text_regions
+                text_regions = warped_text_regions
+            else:
+                entities = []
+                text_regions = []
         
-        packet = VisionPacket(
-            t=time.time(),
-            frame_id=self.frame_id,
-            scene_embedding=self.prev_state.scene_tokens.mean(axis=0) if self.prev_state else np.zeros(self.config.feature_dim),
-            entities=entities,
-            text_regions=[],
-            changes=[],
-            fovea_requests=[],
-            processing_time_ms=(time.time() - start) * 1000,
-            inference_mode="reuse",
-            peripheral_resolution=self.config.peripheral_resolution
-        )
+            packet = VisionPacket(
+                t=time.time(),
+                frame_id=self.frame_id,
+                scene_embedding=self.prev_state.scene_tokens.mean(axis=0) if self.prev_state else np.zeros(self.config.feature_dim),
+                entities=entities,
+                text_regions=text_regions,
+                changes=[],
+                fovea_requests=[],
+                processing_time_ms=(time.time() - start) * 1000,
+                inference_mode="reuse",
+                peripheral_resolution=self.config.peripheral_resolution
+            )
         
-        self.prev_frame = frame.copy()
-        # State already updated above
+            self.prev_frame = frame.copy()
+            # State already updated above
         
-        return InferenceResult(
-            packet=packet,
-            backend_time_ms=packet.processing_time_ms,
-            mode="reuse",
-            decision="REUSE"
-        )
+            return InferenceResult(
+                packet=packet,
+                backend_time_ms=packet.processing_time_ms,
+                mode="reuse",
+                decision="REUSE"
+            )
     
     def _tokens_to_entities(self, tokens: torch.Tensor, uncertainties: np.ndarray) -> List[Entity]:
         """Convert scene tokens to entities (placeholder - needs proper decoder)"""
