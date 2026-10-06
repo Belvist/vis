@@ -56,8 +56,8 @@ def test_static_scene():
     assert result.success, f"Frame 1 failed: {result.error}"
     assert result.data['meta']['decision'] == 'KEYFRAME', f"Frame 1: expected KEYFRAME, got {result.data['meta']['decision']}"
     
-    # Frames 2-10 - should all be REUSE
-    for i in range(2, 11):
+    # Frames 2-100 - should all be REUSE
+    for i in range(2, 101):
         result = api.process_frame(frame)
         assert result.success, f"Frame {i} failed: {result.error}"
         assert result.data['meta']['decision'] == 'REUSE', f"Frame {i}: expected REUSE, got {result.data['meta']['decision']}"
@@ -85,13 +85,19 @@ def test_moving_object():
     assert result.data['meta']['decision'] == 'KEYFRAME'
     
     # Frames 2-5: small object moving 10px per frame
+    roi_correct_count = 0
     for i in range(2, 6):
         f = frame.copy()
         cv2.rectangle(f, (100 + (i-1)*10, 100), (120 + (i-1)*10, 120), (0, 255, 0), -1)
         result = api.process_frame(f)
         assert result.success, f"Frame {i} failed: {result.error}"
         # Should be ROI_CORRECT for small changes
+        if result.data['meta']['decision'] == 'ROI_CORRECT':
+            roi_correct_count += 1
         print(f"  Frame {i}: {result.data['meta']['decision']} (entities: {len(result.data['entities'])})")
+    
+    # At least one ROI_CORRECT expected for moving object
+    assert roi_correct_count > 0, f"Expected at least one ROI_CORRECT, got {roi_correct_count}"
     
     print("✓ MOVING OBJECT test completed")
     return True
@@ -148,6 +154,7 @@ def test_scene_cut():
     result2 = api.process_frame(frame2)
     assert result2.success
     # Should detect scene cut and do KEYFRAME
+    assert result2.data['meta']['decision'] == 'KEYFRAME', f"Frame 2: expected KEYFRAME, got {result2.data['meta']['decision']}"
     print(f"  Frame 2 (scene cut): {result2.data['meta']['decision']}")
     
     print("✓ SCENE CUT test completed")

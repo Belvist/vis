@@ -444,10 +444,10 @@ class EarAI:
             if self.prev_state is not None:
                 updated_centroids = self.prev_state.token_centroids.cpu().numpy()
         
-        # Warp text_regions with motion
+        # Warp text_regions with motion for NEXT frame
         updated_text_regions = []
-        if self.prev_state is not None and motion is not None:
-            for tr in self.prev_state.text_regions:
+        if text_regions and motion is not None:
+            for tr in text_regions:
                 warped_bbox = motion.warp_bbox(np.array([tr.bbox.x1, tr.bbox.y1, tr.bbox.x2, tr.bbox.y2]))
                 updated_text_regions.append(TextRegion(
                     value=tr.value,
@@ -456,7 +456,17 @@ class EarAI:
                     language=tr.language
                 ))
         else:
-            updated_text_regions = self.prev_state.text_regions if self.prev_state else []
+            # Fallback: warp previous text_regions
+            updated_text_regions = []
+            if self.prev_state is not None and motion is not None:
+                for tr in self.prev_state.text_regions:
+                    warped_bbox = motion.warp_bbox(np.array([tr.bbox.x1, tr.bbox.y1, tr.bbox.x2, tr.bbox.y2]))
+                    updated_text_regions.append(TextRegion(
+                        value=tr.value,
+                        bbox=BBox(*warped_bbox),
+                        confidence=tr.confidence,
+                        language=tr.language
+                    ))
         
         # 10. Update state
         new_state = VisualState(
