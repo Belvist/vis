@@ -211,7 +211,7 @@ class EarAI:
             frame=frame,
             motion_transform=motion,
             prev_frame=self.prev_frame,
-            change_map=residual_map,
+            change_map=binary_mask,  # Use binary mask for contour detection
             uncertainty_map=None,  # Will be filled after state update
             fovea_requests=[],
             text_regions=[]
