@@ -259,10 +259,10 @@ class ROIExtractor:
         
         return inter / (area1 + area2 - inter + 1e-6)
     
-    def crop_rois(self, frame: np.ndarray, rois: List[ResidualROI]) -> torch.Tensor:
+    def crop_rois(self, frame: np.ndarray, frame_warped: np.ndarray, rois: List[ResidualROI]) -> torch.Tensor:
         """
-        Crop and resize ROIs from frame for residual encoder.
-        Returns: [N, 3, H, W] tensor
+        Crop and prepare 9-channel patches from frame for residual encoder.
+        Returns: [N, 9, H, W] tensor (current + warped_prev + diff)
         """
         patches = []
         h, w = frame.shape[:2]
@@ -272,39 +272,83 @@ class ROIExtractor:
             px1, py1 = int(x1 * w), int(y1 * h)
             px2, py2 = int(x2 * w), int(y2 * h)
             
-            crop = frame[py1:py2, px1:px2]
-            if crop.size == 0:
-                crop = np.zeros((self.roi_size[1], self.roi_size[0], 3), dtype=np.uint8)
+            # Crop from both frames
+            crop_curr = frame[py1:py2, px1:px2]
+            crop_warped = frame_warped[py1:py2, px1:px2]
             
-            # Resize to standard size
-            crop = cv2.resize(crop, self.roi_size, interpolation=cv2.INTER_AREA)
-            crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-            crop = crop.astype(np.float32) / 255.0
-            patches.append(crop)
+            if crop_curr.size == 0 or crop_warped.size == 0:
+                crop_curr = np.zeros((self.roi_size[1], self.roi_size[0], 3), dtype=np.uint8)
+                crop_warped = np.zeros((self.roi_size[1], self.roi_size[0], 3), dtype=np.uint8)
+            
+            # Resize
+            crop_curr = cv2.resize(crop_curr, self.roi_size, interpolation=cv2.INTER_AREA)
+            crop_warped = cv2.resize(crop_warped, self.roi_size, interpolation=cv2.INTER_AREA)
+            
+            # Convert to RGB and normalize
+            crop_curr = cv2.cvtColor(crop_curr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            crop_warped = cv2.cvtColor(crop_warped, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            
+            # Compute diff
+            crop_diff = np.abs(crop_curr - crop_warped)
+            
+            # Stack: current (3) + warped_prev (3) + diff (3) = 9 channels
+            patch_9ch = np.concatenate([crop_curr, crop_warped, crop_diff], axis=-1)
+            patches.append(patch_9ch)
         
         if not patches:
-            return torch.zeros((0, 3, *self.roi_size))
+            return torch.zeros((0, 9, *self.roi_size))
         
-        batch = np.stack(patches)  # [N, H, W, 3]
-        batch = torch.from_numpy(batch).permute(0, 3, 1, 2)  # [N, 3, H, W]
+        batch = np.stack(patches)  # [N, H, W, 9]
+        batch = torch.from_numpy(batch).permute(0, 3, 1, 2)  # [N, 9, H, W]
         return batch
 
 
 def compute_residual_frame(frame_curr: np.ndarray, 
-                           frame_prev_warped: np.ndarray) -> np.ndarray:
+                           frame_prev_warped: np.ndarray,
+                           valid_mask: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
     """
     Compute residual between current frame and motion-warped previous frame.
-    Returns: residual magnitude map [H, W]
+    Returns: (residual magnitude map [H, W], valid mask [H, W])
     """
     diff = cv2.absdiff(frame_curr, frame_prev_warped)
     gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+    
     # Normalize
     residual = gray.astype(np.float32) / 255.0
-    return residual
+    
+    # Noise/illumination normalization: local mean subtraction
+    # Use a large kernel to estimate local illumination
+    kernel_size = 31
+    local_mean = cv2.blur(residual, (kernel_size, kernel_size))
+    residual_norm = residual - local_mean
+    residual_norm = np.clip(residual_norm + 0.5, 0, 1)
+    
+    # Threshold
+    threshold = 0.05
+    binary = (residual_norm > threshold).astype(np.uint8) * 255
+    
+    # Morphological cleanup
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    
+    # Apply valid mask if provided (to exclude warped borders)
+    if valid_mask is not None:
+        binary = cv2.bitwise_and(binary, (valid_mask > 0).astype(np.uint8) * 255)
+    
+    # Connected components
+    num_labels, labels = cv2.connectedComponents(binary)
+    
+    # Create magnitude map (normalized residual for thresholding)
+    magnitude = residual_norm
+    
+    return magnitude, binary
 
 
-def warp_frame(frame: np.ndarray, transform) -> np.ndarray:
-    """Warp frame using affine transform from previous to current frame"""
+def warp_frame(frame: np.ndarray, transform) -> Tuple[np.ndarray, np.ndarray]:
+    """Warp frame using affine transform from previous to current frame.
+    Returns: (warped frame, valid mask)
+    """
     h, w = frame.shape[:2]
     # Convert normalized transform to pixel coordinates
     M = np.eye(3, dtype=np.float32)
@@ -313,4 +357,10 @@ def warp_frame(frame: np.ndarray, transform) -> np.ndarray:
     
     # Apply forward transform (prev -> current), NO WARP_INVERSE_MAP
     warped = cv2.warpAffine(frame, M[:2], (w, h), flags=cv2.INTER_LINEAR)
-    return warped
+    
+    # Create valid mask (areas that came from valid source pixels)
+    valid_mask = np.ones((h, w), dtype=np.uint8)
+    warped_mask = cv2.warpAffine(valid_mask, M[:2], (w, h), 
+                                 flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    
+    return warped, warped_mask

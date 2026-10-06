@@ -19,6 +19,13 @@ try:
 except Exception:
     IMAGENET_CATEGORIES = None
 
+# Import residual encoder functions
+from ..heads.residual_encoder import (
+    warp_frame, 
+    compute_residual_frame, 
+    ResidualROI
+)
+
 from .config import EarAIConfig, DEFAULT_CONFIG
 from .packets import VisionPacket, Entity, BBox, TextRegion, SceneChange
 
@@ -64,9 +71,9 @@ class EarAI:
         
         # Adaptive token pooler (replaces fixed grid)
         self.token_pooler = create_adaptive_pooler({
-            "type": "tokenlearner",
-            "in_channels": config.feature_dim,
-            "num_tokens": config.num_scene_tokens,
+            "type": "multiscale_tokenlearner",
+            "channels_list": [self.config.feature_dim, self.config.feature_dim, self.config.feature_dim, self.config.feature_dim],
+            "num_tokens_per_scale": [4, 4, 4, 4],  # 4 tokens per scale = 16 total
             "bottleneck_dim": 64
         }).to(self.device).eval()
         
@@ -78,32 +85,32 @@ class EarAI:
         
         # Residual encoder
         self.residual_encoder = ResidualEncoder(
-            in_channels=3,
-            feature_dim=config.feature_dim
+            in_channels=9,  # current + warped_prev + diff = 9 channels
+            feature_dim=self.config.feature_dim
         ).to(self.device).eval()
         
         # ROI extractor
         self.roi_extractor = ROIExtractor(
-            base_resolution=config.peripheral_resolution,
+            base_resolution=self.config.peripheral_resolution,
             roi_size=(64, 64),
-            context_margin=0.2,
+            context_margin=0.1,
             max_rois=8
         )
         
         # State updater
         self.state_updater = GatedStateUpdater(
-            state_dim=config.feature_dim,
+            state_dim=self.config.feature_dim,
             hidden_dim=512
         ).to(self.device).eval()
         
         # Uncertainty estimator
         self.uncertainty_estimator = UncertaintyEstimator(
-            state_dim=config.feature_dim
+            state_dim=self.config.feature_dim
         ).to(self.device).eval()
         
         # Keyframe decider
         self.keyframe_decider = KeyframeDecider(
-            state_dim=config.feature_dim,
+            state_dim=self.config.feature_dim,
             reuse_threshold=0.3,
             roi_threshold=0.5,
             max_roi_ratio=0.3
@@ -191,12 +198,12 @@ class EarAI:
         
         # 2. Warp previous frame
         if self.prev_frame is not None:
-            self.prev_frame_warped = warp_frame(self.prev_frame, motion)
+            self.prev_frame_warped, _ = warp_frame(self.prev_frame, motion)
         else:
             self.prev_frame_warped = frame.copy()
         
         # 3. Compute residual
-        residual_map = compute_residual_frame(frame, self.prev_frame_warped)
+        residual_map, binary_mask = compute_residual_frame(frame, self.prev_frame_warped)
         residual_magnitude = float(residual_map.mean())
         
         # 4. Extract ROIs
@@ -272,16 +279,15 @@ class EarAI:
             
             # Multi-scale adaptive token pooling
             if len(features) > 1:
-                # Concatenate spatial features and pool
-                # Simple approach: apply token pooler to each scale and concatenate
-                all_tokens = []
-                for feat in features:
-                    tokens = self.token_pooler(feat)  # [1, num_tokens, D]
-                    all_tokens.append(tokens)
-                # Average tokens across scales (or concatenate then project)
-                scene_tokens = torch.stack(all_tokens).mean(dim=0)  # [1, num_tokens, D]
+                # Use multi-scale token pooler with attention
+                pooler_out = self.token_pooler(features, return_attention=True)
+                scene_tokens = pooler_out["tokens"]
+                # Store attention info for spatial routing
+                self._last_attention = pooler_out.get("attention_per_scale", None)
             else:
-                scene_tokens = self.token_pooler(features[0])
+                pooler_out = self.token_pooler(features[0], return_attention=True)
+                scene_tokens = pooler_out["tokens"]
+                self._last_attention = pooler_out.get("attention_per_scale", None)
             
             global_embedding = backbone_out['global']  # [1, D]
             imagenet_logits = backbone_out.get('imagenet_logits')
@@ -298,13 +304,22 @@ class EarAI:
             fovea_requests = []
             # TODO: generate from entities
         
+        # Extract centroids from attention for spatial routing
+        token_centroids = np.zeros((scene_tokens.shape[1], 2), dtype=np.float32)
+        if hasattr(self, '_last_attention') and self._last_attention:
+            # Use first scale centroids (F4)
+            attn_info = self._last_attention[0] if self._last_attention else None
+            if attn_info and "centroids" in attn_info:
+                token_centroids = attn_info["centroids"].cpu().numpy().squeeze(0)
+        
         # Create initial visual state
         state = VisualState(
-            scene_tokens=scene_tokens.cpu().numpy().squeeze(0),  # [N, D]
-            region_tokens=np.zeros((0, self.config.feature_dim)),  # No regions yet
-            region_bboxes=np.zeros((0, 4)),
+            scene_tokens=torch.from_numpy(scene_tokens.cpu().numpy().squeeze(0)),
+            token_centroids=torch.from_numpy(token_centroids),
+            region_tokens=torch.zeros((0, self.config.feature_dim)),
+            region_bboxes=torch.zeros((0, 4)),
             entity_tracks={},
-            uncertainty=np.zeros(scene_tokens.shape[1]),
+            uncertainty=torch.zeros(scene_tokens.shape[1]),
             frame_id=self.frame_id,
             timestamp=time.time()
         )
@@ -348,46 +363,56 @@ class EarAI:
         NO full backbone pass - only residual encoder + state update."""
         start = time.time()
         
-        # 1. Extract and encode residual patches (ONLY this, no full backbone)
-        residual_patches = self.roi_extractor.crop_rois(frame, rois)
+        # 1. Warp previous frame and compute residual with valid mask
+        if self.prev_frame is not None and motion is not None:
+            frame_warped, valid_mask = warp_frame(self.prev_frame, motion)
+            residual_map, binary_mask = compute_residual_frame(frame, frame_warped, valid_mask)
+        else:
+            frame_warped = frame.copy()
+            valid_mask = np.ones(frame.shape[:2], dtype=np.uint8)
+            residual_map, binary_mask = compute_residual_frame(frame, frame_warped, valid_mask)
+        
+        # 2. Extract and encode residual patches (ONLY this, no full backbone)
+        residual_patches = self.roi_extractor.crop_rois(frame, frame_warped, rois)
         if len(residual_patches) > 0:
-            residual_patches = residual_patches.unsqueeze(0).to(self.device)  # [1, N, 3, H, W]
+            residual_patches = residual_patches.unsqueeze(0).to(self.device)  # [1, N, 9, H, W]
             with torch.no_grad():
                 delta_features = self.residual_encoder(residual_patches)  # [1, N, D]
         else:
             delta_features = torch.zeros((1, 0, self.config.feature_dim), device=self.device)
         
-        # 2. State update using previous state + delta features
+        # 3. State update using previous state + delta features
         if self.prev_state is not None:
             prev_tokens = torch.from_numpy(self.prev_state.scene_tokens).unsqueeze(0).to(self.device)
-            prev_bboxes = torch.from_numpy(self.prev_state.region_bboxes).unsqueeze(0).to(self.device) if len(self.prev_state.region_bboxes) > 0 else torch.zeros((1, 0, 4), device=self.device)
+            prev_centroids = torch.from_numpy(self.prev_state.token_centroids).unsqueeze(0).to(self.device)
             
             # State update with residual features (NO full backbone)
             with torch.no_grad():
                 updated_tokens = self.state_updater(
                     predicted_state=prev_tokens,
+                    predicted_centroids=prev_centroids,
                     delta_features=delta_features,
                     delta_bboxes=torch.tensor(np.array([r.bbox for r in rois]), device=self.device).unsqueeze(0) if rois else torch.zeros((1, 0, 4), device=self.device),
-                    state_bboxes=prev_bboxes
+                    state_centroids=prev_centroids
                 )
         else:
             # No previous state - this shouldn't happen in ROI_CORRECT, fallback to keyframe
             return self._keyframe_inference(frame)
         
-        # 3. Uncertainty estimation
+        # 4. Uncertainty estimation
         with torch.no_grad():
             uncertainties = self.uncertainty_estimator(updated_tokens).cpu().numpy().squeeze()
         
-        # 4. Create entities from updated tokens
+        # 5. Create entities from updated tokens
         entities = self._tokens_to_entities(updated_tokens, uncertainties)
         
-        # 5. OCR (only on ROIs if needed, for now full frame)
+        # 6. OCR (only on ROIs if needed, for now full frame)
         text_regions = self._process_ocr_tesseract(frame)
         
-        # 6. Scene embedding from updated tokens (mean pooling)
+        # 7. Scene embedding from updated tokens (mean pooling)
         scene_embedding = updated_tokens.cpu().numpy().squeeze(0).mean(axis=0)
         
-        # 7. Scene memory update
+        # 8. Scene memory update
         packet = VisionPacket(
             t=time.time(),
             frame_id=self.frame_id,
@@ -403,13 +428,20 @@ class EarAI:
         
         packet = self.scene_memory.update(packet)
         
-        # 8. Update state
+        # 9. Extract updated centroids from attention (if available)
+        updated_centroids = np.zeros((updated_tokens.shape[1], 2), dtype=np.float32)
+        if hasattr(self, '_last_attention') and self._last_attention:
+            # This would need attention from updated tokens - for now use previous centroids
+            pass
+        
+        # 10. Update state
         new_state = VisualState(
-            scene_tokens=updated_tokens.cpu().numpy().squeeze(0),
-            region_tokens=np.zeros((0, self.config.feature_dim)),
-            region_bboxes=np.array([r.bbox for r in rois]) if rois else np.zeros((0, 4)),
+            scene_tokens=torch.from_numpy(updated_tokens.cpu().numpy().squeeze(0)),
+            token_centroids=torch.from_numpy(updated_centroids),
+            region_tokens=torch.zeros((0, self.config.feature_dim)),
+            region_bboxes=torch.from_numpy(np.array([r.bbox for r in rois]) if rois else np.zeros((0, 4))),
             entity_tracks={e.id: e for e in packet.entities},
-            uncertainty=uncertainties,
+            uncertainty=torch.from_numpy(uncertainties),
             frame_id=self.frame_id,
             timestamp=time.time()
         )
@@ -419,6 +451,14 @@ class EarAI:
         self.prev_state = new_state
         
         processing_time = (time.time() - start) * 1000
+        packet.processing_time_ms = processing_time
+        
+        return InferenceResult(
+            packet=packet,
+            backend_time_ms=processing_time,
+            mode="roi_correction",
+            decision="ROI_CORRECT"
+        )
         packet.processing_time_ms = processing_time
         
         return InferenceResult(

@@ -9,6 +9,7 @@ class TokenLearner(nn.Module):
     """
     TokenLearner: learns to pool spatial features into a small number of adaptive tokens.
     From "TokenLearner: Adaptive Space-Time Tokenization for Videos" (Ryoo et al., 2021)
+    Extended to return attention maps and centroids for spatial routing.
     """
     
     def __init__(self, 
@@ -37,16 +38,19 @@ class TokenLearner(nn.Module):
             nn.Linear(in_channels, in_channels)
         )
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_attention: bool = False):
         """
         x: [B, C, H, W] spatial features
-        Returns: [B, num_tokens, C] tokens
+        Returns: 
+            - tokens: [B, num_tokens, C]
+            - attention_maps: [B, num_tokens, H, W] (if return_attention=True)
+            - centroids: [B, num_tokens, 2] normalized [0,1] (if return_attention=True)
         """
         B, C, H, W = x.shape
         
         # Compute attention maps for each token
-        attn_maps = self.attention(x)  # [B, num_tokens, H, W]
-        attn_maps = attn_maps.view(B, self.num_tokens, -1)  # [B, num_tokens, H*W]
+        attn_logits = self.attention(x)  # [B, num_tokens, H, W]
+        attn_maps = attn_logits.view(B, self.num_tokens, -1)  # [B, num_tokens, H*W]
         attn_weights = F.softmax(attn_maps, dim=-1)  # [B, num_tokens, H*W]
         
         # Weighted pooling
@@ -56,7 +60,28 @@ class TokenLearner(nn.Module):
         # Optional refinement
         tokens = self.refine(tokens)
         
-        return tokens
+        if not return_attention:
+            return tokens
+        
+        # Compute centroids for each token
+        attn_weights_2d = attn_weights.view(B, self.num_tokens, H, W)
+        
+        # Create coordinate grids
+        y_coords = torch.arange(H, device=x.device, dtype=torch.float32) / (H - 1)
+        x_coords = torch.arange(W, device=x.device, dtype=torch.float32) / (W - 1)
+        yy, xx = torch.meshgrid(y_coords, x_coords, indexing='ij')  # [H, W]
+        
+        # Compute centroids: weighted sum of coordinates
+        centroid_y = torch.sum(attn_weights_2d * yy, dim=(-1, -2))  # [B, num_tokens]
+        centroid_x = torch.sum(attn_weights_2d * xx, dim=(-1, -2))  # [B, num_tokens]
+        centroids = torch.stack([centroid_x, centroid_y], dim=-1)  # [B, num_tokens, 2]
+        
+        return {
+            "tokens": tokens,
+            "attention_maps": attn_weights_2d,  # [B, num_tokens, H, W]
+            "centroids": centroids,  # [B, num_tokens, 2] normalized [0,1]
+            "attention_logits": attn_logits  # [B, num_tokens, H, W] raw
+        }
 
 
 class MultiScaleTokenLearner(nn.Module):
@@ -80,19 +105,35 @@ class MultiScaleTokenLearner(nn.Module):
         self.total_tokens = sum(num_tokens_per_scale)
         self.scales = len(channels_list)
     
-    def forward(self, features: List[torch.Tensor]) -> torch.Tensor:
+    def forward(self, features: List[torch.Tensor], return_attention: bool = False):
         """
         features: List of [B, C_i, H_i, W_i] for each scale
-        Returns: [B, total_tokens, C] where C is projected to common dim
+        Returns: [B, total_tokens, C] or dict with tokens + attention
         """
         all_tokens = []
+        all_attention = []
+        
         for feat, learner in zip(features, self.token_learners):
-            tokens = learner(feat)  # [B, n_tokens, C_i]
-            all_tokens.append(tokens)
+            if return_attention:
+                out = learner(feat, return_attention=True)
+                all_tokens.append(out["tokens"])
+                all_attention.append({
+                    "attention_maps": out["attention_maps"],
+                    "centroids": out["centroids"],
+                    "scale_shape": feat.shape[-2:]
+                })
+            else:
+                tokens = learner(feat)
+                all_tokens.append(tokens)
         
         # Concatenate tokens from all scales
         tokens = torch.cat(all_tokens, dim=1)  # [B, total_tokens, C_varies]
         
+        if return_attention:
+            return {
+                "tokens": tokens,
+                "attention_per_scale": all_attention
+            }
         return tokens
 
 

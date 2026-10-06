@@ -10,6 +10,7 @@ from dataclasses import dataclass
 class VisualState:
     """Persistent visual state"""
     scene_tokens: torch.Tensor      # [B, num_scene_tokens, D]
+    token_centroids: torch.Tensor   # [B, num_scene_tokens, 2] normalized [0,1]
     region_tokens: torch.Tensor     # [B, num_region_tokens, D] (variable)
     region_bboxes: torch.Tensor     # [B, num_region_tokens, 4] normalized
     entity_tracks: dict             # Tracked entities with IDs
@@ -76,23 +77,20 @@ class GatedStateUpdater(nn.Module):
     
     def forward(self, 
                 predicted_state: torch.Tensor,      # [B, N, D]
+                predicted_centroids: torch.Tensor,  # [B, N, 2]
                 delta_features: torch.Tensor,       # [B, M, D]
                 delta_bboxes: torch.Tensor,         # [B, M, 4]
-                state_bboxes: torch.Tensor) -> torch.Tensor:  # [B, N, 4]
+                state_centroids: torch.Tensor) -> torch.Tensor:  # [B, N, 2]
         """
         Update predicted state with delta features.
-        Uses spatial alignment (bbox overlap) to route deltas to relevant state tokens.
+        Uses spatial alignment (centroid distance) to route deltas to relevant state tokens.
         """
         B, N, D = predicted_state.shape
         B, M, D = delta_features.shape
         
-        # Handle case where state_bboxes is empty (no previous regions)
-        if state_bboxes.shape[1] == 0:
-            # No previous regions - create uniform routing to all state tokens
-            routing = torch.ones(B, N, M, device=predicted_state.device) / N
-        else:
-            # 1. Spatial routing: compute which state tokens each delta affects
-            routing = self._compute_routing(state_bboxes, delta_bboxes)  # [B, N, M]
+        # 1. Spatial routing: compute which state tokens each delta affects
+        # Use centroid distance for routing
+        routing = self._compute_routing_centroids(state_centroids, delta_bboxes)  # [B, N, M]
         
         # 2. Aggregate deltas per state token (weighted by routing)
         routed_deltas = torch.bmm(routing, delta_features)  # [B, N, D]
@@ -123,30 +121,25 @@ class GatedStateUpdater(nn.Module):
         
         return new_state
     
-    def _compute_routing(self, state_bboxes: torch.Tensor, delta_bboxes: torch.Tensor) -> torch.Tensor:
-        """Compute IoU-based routing weights [B, N, M]"""
-        B, N, _ = state_bboxes.shape
+    def _compute_routing_centroids(self, state_centroids: torch.Tensor, delta_bboxes: torch.Tensor) -> torch.Tensor:
+        """Compute distance-based routing weights [B, N, M] using centroids"""
+        B, N, _ = state_centroids.shape
         B, M, _ = delta_bboxes.shape
         
-        # Expand for broadcasting
-        s = state_bboxes.unsqueeze(2).expand(-1, -1, M, -1)  # [B, N, M, 4]
-        d = delta_bboxes.unsqueeze(1).expand(-1, N, -1, -1)  # [B, N, M, 4]
+        # Compute delta centroids from bboxes
+        delta_centroids = torch.stack([
+            (delta_bboxes[..., 0] + delta_bboxes[..., 2]) / 2,
+            (delta_bboxes[..., 1] + delta_bboxes[..., 3]) / 2
+        ], dim=-1)  # [B, M, 2]
         
-        # IoU
-        xi1 = torch.max(s[..., 0], d[..., 0])
-        yi1 = torch.max(s[..., 1], d[..., 1])
-        xi2 = torch.min(s[..., 2], d[..., 2])
-        yi2 = torch.min(s[..., 3], d[..., 3])
+        # Compute pairwise distances
+        # state_centroids: [B, N, 2], delta_centroids: [B, M, 2]
+        dist = torch.cdist(state_centroids, delta_centroids)  # [B, N, M]
         
-        inter = torch.clamp(xi2 - xi1, min=0) * torch.clamp(yi2 - yi1, min=0)
-        area_s = (s[..., 2] - s[..., 0]) * (s[..., 3] - s[..., 1])
-        area_d = (d[..., 2] - d[..., 0]) * (d[..., 3] - d[..., 1])
-        union = area_s + area_d - inter + 1e-6
-        
-        iou = inter / union  # [B, N, M]
-        
-        # Normalize per state token
-        routing = iou / (iou.sum(dim=-1, keepdim=True) + 1e-6)
+        # Convert distance to routing weights (inverse distance with softmax)
+        # Add small epsilon to avoid division by zero
+        inv_dist = 1.0 / (dist + 1e-3)
+        routing = F.softmax(inv_dist * 10.0, dim=1)  # [B, N, M] - softmax over state tokens
         
         return routing
 
