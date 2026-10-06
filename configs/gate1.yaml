@@ -1,0 +1,27 @@
+# Gate 1 Overfit Config
+# Trains on 64 fixed COCO images
+
+# Model
+feature_dim: 256
+num_scene_tokens: 16
+num_classes: 80
+
+# Backbone
+backbone_pretrained: true
+image_size: [224, 224]
+max_objects: 16
+
+# Training
+batch_size: 8
+num_workers: 0
+lr: 0.0001
+weight_decay: 0.0001
+epochs: 100
+eval_every: 10
+
+# Data - MUST have COCO at this path
+data_root: "./data/coco"
+coco_split: "val2017"
+
+# Device
+device: "cpu"
