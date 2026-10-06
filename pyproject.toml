@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vera-eye"
+version = "0.1.0"
+description = "Ultra-lightweight visual coprocessor (3-8 MB) with persistent scene memory"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "opencv-python>=4.8",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "mss"]
+screen = ["mss"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["vera_eye*"]

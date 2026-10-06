@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: vera-eye
+Version: 0.1.0
+Summary: Ultra-lightweight visual coprocessor (3-8 MB) with persistent scene memory
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=2.0
+Requires-Dist: torchvision>=0.15
+Requires-Dist: opencv-python>=4.8
+Requires-Dist: numpy>=1.24
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: mss; extra == "dev"
+Provides-Extra: screen
+Requires-Dist: mss; extra == "screen"
