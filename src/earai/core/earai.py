@@ -225,21 +225,14 @@ class EarAI:
         
         # 6. Quick uncertainty check from previous state
         prev_uncertainty = 0.0
+        prev_unc = 0.0
         if self.prev_state is not None:
             with torch.no_grad():
-                prev_tokens = torch.from_numpy(self.prev_state.scene_tokens).unsqueeze(0).to(self.device)
+                prev_tokens = self.prev_state.scene_tokens.unsqueeze(0).to(self.device)
                 prev_unc = self.uncertainty_estimator(prev_tokens).max().item()
                 prev_uncertainty = prev_unc
         
         # 7. Keyframe decision - use threshold-based (learned gate is untrained)
-        if self.prev_state is not None:
-            with torch.no_grad():
-                prev_tokens = torch.from_numpy(self.prev_state.scene_tokens).unsqueeze(0).to(self.device)
-                prev_unc = self.uncertainty_estimator(prev_tokens).max().item()
-        else:
-            prev_unc = 0.0
-        
-        # Use threshold-based decision (learned gate is untrained)
         decision = self.keyframe_decider.decide_threshold(
             uncertainties=torch.tensor([prev_unc]),
             residual_magnitude=residual_magnitude,
@@ -304,13 +297,18 @@ class EarAI:
             fovea_requests = []
             # TODO: generate from entities
         
-        # Extract centroids from attention for spatial routing
-        token_centroids = np.zeros((scene_tokens.shape[1], 2), dtype=np.float32)
+        # Extract centroids from attention for spatial routing (concatenate all scales)
+        token_centroids_list = []
         if hasattr(self, '_last_attention') and self._last_attention:
-            # Use first scale centroids (F4)
-            attn_info = self._last_attention[0] if self._last_attention else None
-            if attn_info and "centroids" in attn_info:
-                token_centroids = attn_info["centroids"].cpu().numpy().squeeze(0)
+            for attn_info in self._last_attention:
+                if attn_info and "centroids" in attn_info:
+                    cents = attn_info["centroids"].cpu().numpy().squeeze(0)
+                    token_centroids_list.append(cents)
+        
+        if token_centroids_list:
+            token_centroids = np.concatenate(token_centroids_list, axis=0)
+        else:
+            token_centroids = np.zeros((scene_tokens.shape[1], 2), dtype=np.float32)
         
         # Create initial visual state
         state = VisualState(
@@ -383,8 +381,8 @@ class EarAI:
         
         # 3. State update using previous state + delta features
         if self.prev_state is not None:
-            prev_tokens = torch.from_numpy(self.prev_state.scene_tokens).unsqueeze(0).to(self.device)
-            prev_centroids = torch.from_numpy(self.prev_state.token_centroids).unsqueeze(0).to(self.device)
+            prev_tokens = self.prev_state.scene_tokens.unsqueeze(0).to(self.device)
+            prev_centroids = self.prev_state.token_centroids.unsqueeze(0).to(self.device)
             
             # State update with residual features (NO full backbone)
             with torch.no_grad():
@@ -429,10 +427,19 @@ class EarAI:
         packet = self.scene_memory.update(packet)
         
         # 9. Extract updated centroids from attention (if available)
+        # Since we don't run backbone in ROI_CORRECT, warp previous centroids with motion
         updated_centroids = np.zeros((updated_tokens.shape[1], 2), dtype=np.float32)
-        if hasattr(self, '_last_attention') and self._last_attention:
-            # This would need attention from updated tokens - for now use previous centroids
-            pass
+        if self.prev_state is not None and motion is not None:
+            prev_centroids_np = self.prev_state.token_centroids.cpu().numpy()
+            for i in range(len(prev_centroids_np)):
+                cx, cy = prev_centroids_np[i]
+                cx_new = cx * motion.matrix[0,0] + cy * motion.matrix[0,1] + motion.translation[0]
+                cy_new = cx * motion.matrix[1,0] + cy * motion.matrix[1,1] + motion.translation[1]
+                updated_centroids[i] = [cx_new, cy_new]
+        else:
+            # Fallback to previous centroids
+            if self.prev_state is not None:
+                updated_centroids = self.prev_state.token_centroids.cpu().numpy()
         
         # 10. Update state
         new_state = VisualState(
@@ -469,11 +476,20 @@ class EarAI:
         )
     
     def _reuse_inference(self, frame: np.ndarray, motion) -> InferenceResult:
-        """Fast path: reuse previous state with motion compensation only"""
+        """Fast path: reuse previous state with motion compensation"""
         start = time.time()
         
-        # Just warp previous state
+        # Warp visual state (tokens + centroids) with motion
         if self.prev_state is not None:
+            # Warp token centroids
+            prev_centroids = self.prev_state.token_centroids.clone()
+            warped_centroids = torch.zeros_like(prev_centroids)
+            for i in range(len(prev_centroids)):
+                cx, cy = prev_centroids[i]
+                cx_new = cx * motion.matrix[0,0] + cy * motion.matrix[0,1] + motion.translation[0]
+                cy_new = cx * motion.matrix[1,0] + cy * motion.matrix[1,1] + motion.translation[1]
+                warped_centroids[i] = torch.tensor([cx_new, cy_new])
+            
             # Update entity positions with motion
             entities = []
             for entity in self.scene_memory.entities.values():
@@ -481,6 +497,9 @@ class EarAI:
                 warped_bbox = motion.warp_bbox(np.array([e.bbox.x1, e.bbox.y1, e.bbox.x2, e.bbox.y2]))
                 e.bbox = BBox(*warped_bbox)
                 entities.append(e)
+            
+            # Update state with warped centroids (semantic tokens unchanged)
+            self.prev_state.token_centroids = warped_centroids
         else:
             entities = []
         
@@ -498,7 +517,7 @@ class EarAI:
         )
         
         self.prev_frame = frame.copy()
-        # State unchanged
+        # State already updated above
         
         return InferenceResult(
             packet=packet,

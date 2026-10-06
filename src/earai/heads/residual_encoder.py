@@ -310,22 +310,26 @@ def compute_residual_frame(frame_curr: np.ndarray,
     Compute residual between current frame and motion-warped previous frame.
     Returns: (residual magnitude map [H, W], valid mask [H, W])
     """
-    diff = cv2.absdiff(frame_curr, frame_prev_warped)
-    gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+    # Convert to grayscale first
+    curr_gray = cv2.cvtColor(frame_curr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    prev_gray = cv2.cvtColor(frame_prev_warped, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    
+    # SIGNED difference (not absolute) - preserves direction of change
+    signed_diff = curr_gray - prev_gray
+    
+    # Illumination compensation: local mean of signed diff
+    kernel_size = 31
+    local_mean = cv2.blur(signed_diff, (kernel_size, kernel_size))
+    
+    # Structural change = absolute of illumination-compensated difference
+    structural = np.abs(signed_diff - local_mean)
     
     # Normalize
-    residual = gray.astype(np.float32) / 255.0
-    
-    # Noise/illumination normalization: local mean subtraction
-    # Use a large kernel to estimate local illumination
-    kernel_size = 31
-    local_mean = cv2.blur(residual, (kernel_size, kernel_size))
-    residual_norm = residual - local_mean
-    residual_norm = np.clip(residual_norm + 0.5, 0, 1)
+    magnitude = structural  # Already in [0, 1]
     
     # Threshold
     threshold = 0.05
-    binary = (residual_norm > threshold).astype(np.uint8) * 255
+    binary = (magnitude > threshold).astype(np.uint8) * 255
     
     # Morphological cleanup
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -338,9 +342,6 @@ def compute_residual_frame(frame_curr: np.ndarray,
     
     # Connected components
     num_labels, labels = cv2.connectedComponents(binary)
-    
-    # Create magnitude map (normalized residual for thresholding)
-    magnitude = residual_norm
     
     return magnitude, binary
 

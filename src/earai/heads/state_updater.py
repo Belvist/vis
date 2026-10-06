@@ -35,18 +35,9 @@ class GatedStateUpdater(nn.Module):
     def __init__(self, 
                  state_dim: int = 256,
                  hidden_dim: int = 512,
-                 num_heads: int = 4,
                  dropout: float = 0.0):
         super().__init__()
         self.state_dim = state_dim
-        
-        # Cross-attention: state tokens attend to delta features
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=state_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
         
         # GRU-style gates
         self.gate_z = nn.Sequential(
@@ -69,9 +60,6 @@ class GatedStateUpdater(nn.Module):
             nn.Linear(hidden_dim, state_dim)
         )
         
-        self.norm1 = nn.LayerNorm(state_dim)
-        self.norm2 = nn.LayerNorm(state_dim)
-        
         # Output projection
         self.out_proj = nn.Linear(state_dim, state_dim)
     
@@ -84,6 +72,7 @@ class GatedStateUpdater(nn.Module):
         """
         Update predicted state with delta features.
         Uses spatial alignment (centroid distance) to route deltas to relevant state tokens.
+        Per-token GRU update - no global attention.
         """
         B, N, D = predicted_state.shape
         B, M, D = delta_features.shape
@@ -95,24 +84,14 @@ class GatedStateUpdater(nn.Module):
         # 2. Aggregate deltas per state token (weighted by routing)
         routed_deltas = torch.bmm(routing, delta_features)  # [B, N, D]
         
-        # 3. Cross-attention: state attends to routed deltas
-        state_norm = self.norm1(predicted_state)
-        delta_norm = self.norm1(routed_deltas)
-        
-        attended, _ = self.cross_attn(
-            query=state_norm,
-            key=delta_norm,
-            value=delta_norm
-        )
-        attended = attended + predicted_state  # residual
-        
-        # 4. GRU-style gated update
-        combined = torch.cat([predicted_state, attended], dim=-1)  # [B, N, 2D]
+        # 3. Per-token GRU-style gated update (no global attention)
+        # Each token updates independently based on its routed delta
+        combined = torch.cat([predicted_state, routed_deltas], dim=-1)  # [B, N, 2D]
         
         z = self.gate_z(combined)  # update gate
         r = self.gate_r(combined)  # reset gate
         
-        candidate_input = torch.cat([predicted_state, r * attended], dim=-1)
+        candidate_input = torch.cat([predicted_state, r * routed_deltas], dim=-1)
         h_candidate = self.candidate(candidate_input)
         
         # New state
