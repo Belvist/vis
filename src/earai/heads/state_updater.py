@@ -86,9 +86,13 @@ class GatedStateUpdater(nn.Module):
         B, N, D = predicted_state.shape
         B, M, D = delta_features.shape
         
-        # 1. Spatial routing: compute which state tokens each delta affects
-        # Simple IoU-based routing
-        routing = self._compute_routing(state_bboxes, delta_bboxes)  # [B, N, M]
+        # Handle case where state_bboxes is empty (no previous regions)
+        if state_bboxes.shape[1] == 0:
+            # No previous regions - create uniform routing to all state tokens
+            routing = torch.ones(B, N, M, device=predicted_state.device) / N
+        else:
+            # 1. Spatial routing: compute which state tokens each delta affects
+            routing = self._compute_routing(state_bboxes, delta_bboxes)  # [B, N, M]
         
         # 2. Aggregate deltas per state token (weighted by routing)
         routed_deltas = torch.bmm(routing, delta_features)  # [B, N, D]
@@ -181,7 +185,7 @@ class KeyframeDecider(nn.Module):
     def __init__(self, 
                  state_dim: int = 256,
                  hidden_dim: int = 128,
-                 reuse_threshold: float = 0.3,  # Higher threshold since uncertainty estimator is untrained
+                 reuse_threshold: float = 0.3,
                  roi_threshold: float = 0.5,
                  max_roi_ratio: float = 0.3):
         super().__init__()
@@ -189,10 +193,11 @@ class KeyframeDecider(nn.Module):
         self.roi_threshold = roi_threshold
         self.max_roi_ratio = max_roi_ratio
         
+        # Input: mean_state(256) + max_uncertainty(1) + residual_magnitude(1) + roi_area_ratio(1) = 259
         self.decider = nn.Sequential(
-            nn.Linear(state_dim * 2 + 2, hidden_dim),  # mean_state + max_uncertainty + residual_stats
+            nn.Linear(state_dim + 3, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, 3),  # REUSE, ROI, KEYFRAME logits
+            nn.Linear(hidden_dim, 3),
         )
     
     def forward(self, 

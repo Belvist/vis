@@ -66,7 +66,7 @@ class EarAI:
         self.token_pooler = create_adaptive_pooler({
             "type": "tokenlearner",
             "in_channels": config.feature_dim,
-            "num_tokens": config.max_entities,
+            "num_tokens": config.num_scene_tokens,
             "bottleneck_dim": 64
         }).to(self.device).eval()
         
@@ -104,7 +104,7 @@ class EarAI:
         # Keyframe decider
         self.keyframe_decider = KeyframeDecider(
             state_dim=config.feature_dim,
-            reuse_threshold=0.1,
+            reuse_threshold=0.3,
             roi_threshold=0.5,
             max_roi_ratio=0.3
         ).to(self.device).eval()
@@ -224,9 +224,17 @@ class EarAI:
                 prev_unc = self.uncertainty_estimator(prev_tokens).max().item()
                 prev_uncertainty = prev_unc
         
-        # 7. Keyframe decision
+        # 7. Keyframe decision - use threshold-based (learned gate is untrained)
+        if self.prev_state is not None:
+            with torch.no_grad():
+                prev_tokens = torch.from_numpy(self.prev_state.scene_tokens).unsqueeze(0).to(self.device)
+                prev_unc = self.uncertainty_estimator(prev_tokens).max().item()
+        else:
+            prev_unc = 0.0
+        
+        # Use threshold-based decision (learned gate is untrained)
         decision = self.keyframe_decider.decide_threshold(
-            uncertainties=torch.tensor([prev_uncertainty]) if prev_uncertainty else torch.tensor([0.0]),
+            uncertainties=torch.tensor([prev_unc]),
             residual_magnitude=residual_magnitude,
             roi_area_ratio=roi_area_ratio
         )
@@ -246,7 +254,7 @@ class EarAI:
             return result
     
     def _keyframe_inference(self, frame: np.ndarray) -> InferenceResult:
-        """Full keyframe inference - initialize state from scratch"""
+        """Full keyframe inference - initialize state from scratch using multi-scale features"""
         start = time.time()
         
         # Preprocess
@@ -256,15 +264,24 @@ class EarAI:
         with torch.no_grad():
             backbone_out = self.backbone(peripheral_tensor)
             
-            # Get multi-scale features
+            # Get multi-scale features for adaptive pooling
             features = []
             for scale in ['F4', 'F8', 'F16', 'F32']:
                 if scale in backbone_out:
                     features.append(backbone_out[scale])
             
-            # Adaptive token pooling
-            scene_tokens = self.token_pooler(features[0])  # Use F4 for now
-            # TODO: multi-scale pooling
+            # Multi-scale adaptive token pooling
+            if len(features) > 1:
+                # Concatenate spatial features and pool
+                # Simple approach: apply token pooler to each scale and concatenate
+                all_tokens = []
+                for feat in features:
+                    tokens = self.token_pooler(feat)  # [1, num_tokens, D]
+                    all_tokens.append(tokens)
+                # Average tokens across scales (or concatenate then project)
+                scene_tokens = torch.stack(all_tokens).mean(dim=0)  # [1, num_tokens, D]
+            else:
+                scene_tokens = self.token_pooler(features[0])
             
             global_embedding = backbone_out['global']  # [1, D]
             imagenet_logits = backbone_out.get('imagenet_logits')
@@ -327,13 +344,11 @@ class EarAI:
     
     def _roi_correction_inference(self, frame: np.ndarray, motion, rois: List[ResidualROI], 
                                    residual_magnitude: float) -> InferenceResult:
-        """ROI correction: encode residuals only in changed regions, update state"""
+        """ROI correction: encode residuals ONLY in changed regions, update state.
+        NO full backbone pass - only residual encoder + state update."""
         start = time.time()
         
-        # 1. Preprocess full frame for backbone (needed for adaptive pooling)
-        peripheral_tensor = self.preprocess(frame, self.config.peripheral_resolution)
-        
-        # 2. Extract and encode residual patches
+        # 1. Extract and encode residual patches (ONLY this, no full backbone)
         residual_patches = self.roi_extractor.crop_rois(frame, rois)
         if len(residual_patches) > 0:
             residual_patches = residual_patches.unsqueeze(0).to(self.device)  # [1, N, 3, H, W]
@@ -342,33 +357,12 @@ class EarAI:
         else:
             delta_features = torch.zeros((1, 0, self.config.feature_dim), device=self.device)
         
-        # 3. Backbone features for adaptive pooling
-        with torch.no_grad():
-            backbone_out = self.backbone(peripheral_tensor)
-            features = []
-            for scale in ['F4', 'F8', 'F16', 'F32']:
-                if scale in backbone_out:
-                    features.append(backbone_out[scale])
-            
-            # Adaptive token pooling
-            scene_tokens = self.token_pooler(features[0])  # [1, N, D]
-            
-            global_embedding = backbone_out['global']
-            imagenet_logits = backbone_out.get('imagenet_logits')
-        
-        # 4. Warp previous state tokens
+        # 2. State update using previous state + delta features
         if self.prev_state is not None:
             prev_tokens = torch.from_numpy(self.prev_state.scene_tokens).unsqueeze(0).to(self.device)
             prev_bboxes = torch.from_numpy(self.prev_state.region_bboxes).unsqueeze(0).to(self.device) if len(self.prev_state.region_bboxes) > 0 else torch.zeros((1, 0, 4), device=self.device)
             
-            # Warp bboxes using motion
-            warped_bboxes = []
-            for bbox in self.prev_state.region_bboxes:
-                warped = motion.warp_bbox(bbox)
-                warped_bboxes.append(warped)
-            warped_bboxes = torch.tensor(warped_bboxes, device=self.device).unsqueeze(0) if warped_bboxes else torch.zeros((1, 0, 4), device=self.device)
-            
-            # State update with residual features
+            # State update with residual features (NO full backbone)
             with torch.no_grad():
                 updated_tokens = self.state_updater(
                     predicted_state=prev_tokens,
@@ -377,27 +371,27 @@ class EarAI:
                     state_bboxes=prev_bboxes
                 )
         else:
-            updated_tokens = scene_tokens
+            # No previous state - this shouldn't happen in ROI_CORRECT, fallback to keyframe
+            return self._keyframe_inference(frame)
         
-        # 5. Uncertainty estimation
+        # 3. Uncertainty estimation
         with torch.no_grad():
             uncertainties = self.uncertainty_estimator(updated_tokens).cpu().numpy().squeeze()
         
-        # 6. Create entities from updated tokens (simplified)
+        # 4. Create entities from updated tokens
         entities = self._tokens_to_entities(updated_tokens, uncertainties)
         
-        # 7. ImageNet entities
-        if imagenet_logits is not None:
-            entities.extend(self._process_imagenet(imagenet_logits))
-        
-        # 8. OCR
+        # 5. OCR (only on ROIs if needed, for now full frame)
         text_regions = self._process_ocr_tesseract(frame)
         
-        # 9. Scene memory update
+        # 6. Scene embedding from updated tokens (mean pooling)
+        scene_embedding = updated_tokens.cpu().numpy().squeeze(0).mean(axis=0)
+        
+        # 7. Scene memory update
         packet = VisionPacket(
             t=time.time(),
             frame_id=self.frame_id,
-            scene_embedding=global_embedding.cpu().numpy().squeeze(),
+            scene_embedding=scene_embedding,
             entities=entities,
             text_regions=text_regions,
             changes=[],
@@ -409,7 +403,7 @@ class EarAI:
         
         packet = self.scene_memory.update(packet)
         
-        # 10. Update state
+        # 8. Update state
         new_state = VisualState(
             scene_tokens=updated_tokens.cpu().numpy().squeeze(0),
             region_tokens=np.zeros((0, self.config.feature_dim)),

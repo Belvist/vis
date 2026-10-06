@@ -25,6 +25,7 @@ class EarAIConfig:
     # Scene memory
     max_entities: int = 100
     entity_embedding_dim: int = 256
+    num_scene_tokens: int = 16  # Adaptive tokens (8-16), not max_entities
     memory_decay: float = 0.99
     association_iou_threshold: float = 0.3
     association_visual_threshold: float = 0.7

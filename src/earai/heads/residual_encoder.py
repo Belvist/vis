@@ -304,13 +304,13 @@ def compute_residual_frame(frame_curr: np.ndarray,
 
 
 def warp_frame(frame: np.ndarray, transform) -> np.ndarray:
-    """Warp frame using affine transform"""
+    """Warp frame using affine transform from previous to current frame"""
     h, w = frame.shape[:2]
     # Convert normalized transform to pixel coordinates
     M = np.eye(3, dtype=np.float32)
     M[:2, :2] = transform.matrix
     M[:2, 2] = transform.translation * np.array([w, h])
     
-    warped = cv2.warpAffine(frame, M[:2], (w, h), 
-                            flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP)
+    # Apply forward transform (prev -> current), NO WARP_INVERSE_MAP
+    warped = cv2.warpAffine(frame, M[:2], (w, h), flags=cv2.INTER_LINEAR)
     return warped
