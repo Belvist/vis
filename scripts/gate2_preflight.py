@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Fast Gate 2 preflight: dataset/split/model/loss/backward contract."""
 import argparse
+import copy
 import json
 
 import torch
@@ -38,14 +39,27 @@ def teacher_targets(batch, device):
     }
 
 
-def main(config_path: str, regenerate: bool):
+def main(config_path: str, regenerate: bool, smoke: bool):
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
-    if regenerate:
+
+    cache_path = "artifacts/gate2_teacher_cache.pt"
+    if smoke:
+        cfg = copy.deepcopy(cfg)
+        cfg["data_root"] = "./data/web_ui_smoke"
+        cfg["train_urls"] = cfg.get("train_urls", [])[:1]
+        cfg["val_urls"] = cfg.get("val_urls", [])[:1]
+        cfg["viewport_sizes"] = cfg.get("viewport_sizes", [[1440, 900]])[:1]
+        cfg["scroll_fractions"] = [0.0]
+        cfg["min_train_samples"] = 1
+        cfg["min_val_samples"] = 1
+        cfg["force_browser_dataset"] = True
+        cache_path = "artifacts/gate2_teacher_cache_smoke.pt"
+    elif regenerate:
         cfg["force_browser_dataset"] = True
 
     device = auto_device()
-    cache = build_teacher_cache(cfg, device="cpu")
+    cache = build_teacher_cache(cfg, device="cpu", cache_path=cache_path)
 
     train_domains = {t.get("domain") for t in cache["targets"] if t.get("split") == "train"}
     val_domains = {t.get("domain") for t in cache["targets"] if t.get("split") == "val"}
@@ -108,5 +122,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/gate2.yaml")
     parser.add_argument("--regenerate-dataset", action="store_true")
+    parser.add_argument("--smoke", action="store_true",
+                        help="Use 1 train URL + 1 val URL for a fast contract check")
     args = parser.parse_args()
-    main(args.config, args.regenerate_dataset)
+    main(args.config, args.regenerate_dataset, args.smoke)
