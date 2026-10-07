@@ -1,272 +1,275 @@
-"""Browser-based UI Dataset Generator - uses Playwright to render HTML/CSS and extract DOM ground truth"""
-import json
+"""Browser-rendered Web UI dataset with DOM/CSS ground truth."""
 import asyncio
+import io
+import json
 from pathlib import Path
-from typing import List, Dict, Any, Optional
-import numpy as np
-from PIL import Image
-import cv2
-import torch
-from tqdm import tqdm
+from typing import Dict, List
 from urllib.parse import urlparse
 
-# UI class mapping (15 classes)
+import numpy as np
+from PIL import Image
+from tqdm import tqdm
+
 UI_CLASSES = [
-    'navbar', 'hero', 'section', 'container', 'card', 'button', 'input',
-    'image', 'icon', 'heading', 'paragraph', 'badge', 'modal', 'footer', 'other'
+    "navbar", "hero", "section", "container", "card", "button", "input",
+    "image", "icon", "heading", "paragraph", "badge", "modal", "footer", "link",
 ]
-UI_CLASS_TO_IDX = {c: i for i, c in enumerate(UI_CLASSES)}
+UI_CLASS_TO_IDX = {name: i for i, name in enumerate(UI_CLASSES)}
 
 
 def extract_domain(url: str) -> str:
-    """Extract domain from URL for train/val split"""
-    parsed = urlparse(url)
-    domain = parsed.netloc.replace('www.', '')
-    return domain
+    return urlparse(url).netloc.lower().removeprefix("www.")
 
 
-async def extract_dom_elements(page, viewport_width: int, viewport_height: int) -> List[Dict]:
-    """Extract all visible UI elements from the DOM with computed styles and bounding boxes"""
-
-    js_script = """
+async def extract_dom_elements(page) -> List[Dict]:
+    """Return visible semantic UI elements in viewport coordinates."""
+    script = r"""
     () => {
-        const elements = [];
-        const allElements = document.querySelectorAll('*');
+      const isVisible = (el) => {
+        const s = getComputedStyle(el);
+        if (s.display === 'none' || s.visibility === 'hidden' || parseFloat(s.opacity || '1') <= 0) return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 2 && r.height > 2 &&
+               r.right > 0 && r.bottom > 0 &&
+               r.left < innerWidth && r.top < innerHeight;
+      };
 
-        for (const el of allElements) {
-            const style = window.getComputedStyle(el);
-            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
+      const classify = (el) => {
+        const tag = el.tagName.toLowerCase();
+        const cls = String(el.className && el.className.baseVal !== undefined ? el.className.baseVal : (el.className || '')).toLowerCase();
+        const role = (el.getAttribute('role') || '').toLowerCase();
+        const directText = Array.from(el.childNodes)
+          .filter(n => n.nodeType === Node.TEXT_NODE)
+          .map(n => (n.textContent || '').trim()).join(' ').trim();
 
-            const rect = el.getBoundingClientRect();
-            if (rect.width <= 1 || rect.height <= 1) continue;
-            if (rect.x + rect.width < 0 || rect.y + rect.height < 0) continue;
-            if (rect.x > window.innerWidth || rect.y > window.innerHeight) continue;
+        if (tag === 'nav' || role === 'navigation' || cls.includes('navbar') || cls.includes('nav-')) return 'navbar';
+        if (tag === 'header' || cls.includes('hero') || cls.includes('banner')) return 'hero';
+        if (tag === 'dialog' || role === 'dialog' || cls.includes('modal')) return 'modal';
+        if (tag === 'footer') return 'footer';
+        if (tag === 'button' || role === 'button' || (tag === 'a' && (cls.includes('btn') || cls.includes('button')))) return 'button';
+        if (tag === 'input' || tag === 'textarea' || tag === 'select') return 'input';
+        if (tag === 'img' || tag === 'picture' || cls.includes('image') || cls.includes('img-')) return 'image';
+        if (tag === 'svg' || tag === 'i' || cls.includes('icon')) return 'icon';
+        if (/^h[1-6]$/.test(tag)) return 'heading';
+        if (tag === 'section' || cls.includes('section')) return 'section';
+        if (tag === 'article' || cls.includes('card') || cls.includes('tile')) return 'card';
+        if (cls.includes('badge') || cls.includes('pill') || cls.includes('tag')) return 'badge';
+        if (tag === 'a') return 'link';
+        if (tag === 'main' || (tag === 'div' && (cls.includes('container') || cls.includes('wrapper')))) return 'container';
+        if (tag === 'p' || (tag === 'span' && directText.length > 0) || (tag === 'div' && directText.length > 20)) return 'paragraph';
+        return null;
+      };
 
-            let text = '';
-            for (const node of el.childNodes) {
-                if (node.nodeType === Node.TEXT_NODE) {
-                    const t = node.textContent.trim();
-                    if (t) text += t.replace(/\\0/g, '');
-                }
-            }
-            text = text.slice(0, 200);
-
-            let uiType = 'other';
-            const tag = el.tagName.toLowerCase();
-            const className = (el.className && el.className.baseVal !== undefined) ? el.className.baseVal : (el.className || '');
-            const id = el.id || '';
-            const role = el.getAttribute('role') || '';
-
-            if (tag === 'nav' || className.includes('nav') || role === 'navigation') uiType = 'navbar';
-            else if (tag === 'header' || className.includes('hero') || className.includes('banner')) uiType = 'hero';
-            else if (tag === 'section' || className.includes('section')) uiType = 'section';
-            else if (tag === 'main' || tag === 'div' && (className.includes('container') || className.includes('wrapper'))) uiType = 'container';
-            else if (tag === 'article' || className.includes('card') || className.includes('tile')) uiType = 'card';
-            else if (tag === 'button' || tag === 'a' && (className.includes('btn') || className.includes('button')) || role === 'button') uiType = 'button';
-            else if (tag === 'input' || tag === 'textarea' || tag === 'select') uiType = 'input';
-            else if (tag === 'img' || tag === 'picture' || className.includes('image') || className.includes('img-')) uiType = 'image';
-            else if (tag === 'svg' || tag === 'i' || className.includes('icon')) uiType = 'icon';
-            else if (['h1','h2','h3','h4','h5','h6'].includes(tag)) uiType = 'heading';
-            else if (tag === 'p' || tag === 'span' || tag === 'div' && text.length > 20) uiType = 'paragraph';
-            else if (className.includes('badge') || className.includes('tag') || className.includes('label')) uiType = 'badge';
-            else if (tag === 'dialog' || className.includes('modal') || role === 'dialog') uiType = 'modal';
-            else if (tag === 'footer') uiType = 'footer';
-
-            function sanitize(str) { return str ? str.replace(/\\0/g, '') : ''; }
-            const bgColor = sanitize(style.backgroundColor);
-            const color = sanitize(style.color);
-            const borderRadius = sanitize(style.borderRadius);
-            const fontSize = sanitize(style.fontSize);
-            const fontWeight = sanitize(style.fontWeight);
-            const lineHeight = sanitize(style.lineHeight);
-
-            function parseColor(cssColor) {
-                if (!cssColor || cssColor === 'rgba(0, 0, 0, 0)' || cssColor === 'transparent') return [0.5, 0.5, 0.5];
-                const match = cssColor.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/);
-                if (match) return [parseInt(match[1])/255, parseInt(match[2])/255, parseInt(match[3])/255];
-                return [0.5, 0.5, 0.5];
-            }
-
-            function parsePx(val) { if (!val) return 0; const m = val.match(/([\\d.]+)px/); return m ? parseFloat(m[1]) : 0; }
-
-            let parentId = null;
-            if (el.parentElement) {
-                const parentTag = sanitize(el.parentElement.tagName.toLowerCase());
-                const parentIdStr = sanitize(el.parentElement.id || '');
-                const parentClass = sanitize(Array.from(el.parentElement.classList).join('_') || 'anon');
-                parentId = parentTag + '_' + (parentIdStr || parentClass);
-            }
-
-            elements.push({
-                type: uiType,
-                bbox: [rect.x, rect.y, rect.x + rect.width, rect.y + rect.height],
-                text: text,
-                parent_id: parentId,
-                style: {
-                    background: parseColor(bgColor),
-                    foreground: parseColor(color),
-                    radius: parsePx(borderRadius),
-                    font_size: parsePx(fontSize),
-                    font_weight: parseInt(fontWeight) || 400,
-                    line_height: parsePx(lineHeight) || parsePx(fontSize) * 1.5
-                }
-            });
+      const parseColor = (value, el, prop) => {
+        let v = value;
+        if (!v || v === 'transparent' || v === 'rgba(0, 0, 0, 0)') {
+          let p = el.parentElement;
+          while (p) {
+            const pv = getComputedStyle(p)[prop];
+            if (pv && pv !== 'transparent' && pv !== 'rgba(0, 0, 0, 0)') { v = pv; break; }
+            p = p.parentElement;
+          }
         }
-        return elements;
+        const m = String(v || '').match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+        return m ? [Number(m[1])/255, Number(m[2])/255, Number(m[3])/255] : [0.5, 0.5, 0.5];
+      };
+      const px = (v) => {
+        const m = String(v || '').match(/([\d.]+)px/);
+        return m ? Number(m[1]) : 0;
+      };
+
+      const semantic = Array.from(document.querySelectorAll('*'))
+        .filter(isVisible)
+        .map(el => ({el, type: classify(el)}))
+        .filter(x => x.type !== null);
+
+      const idMap = new Map();
+      semantic.forEach((x, i) => idMap.set(x.el, 'e' + i));
+
+      return semantic.map(({el, type}, i) => {
+        const s = getComputedStyle(el);
+        const r = el.getBoundingClientRect();
+        let parent = el.parentElement;
+        while (parent && !idMap.has(parent)) parent = parent.parentElement;
+        const text = (el.innerText || '').replace(/\0/g, '').trim().replace(/\s+/g, ' ').slice(0, 240);
+        return {
+          element_id: 'e' + i,
+          parent_id: parent ? idMap.get(parent) : null,
+          type,
+          bbox: [r.left, r.top, r.right, r.bottom],
+          text,
+          style: {
+            background: parseColor(s.backgroundColor, el, 'backgroundColor'),
+            foreground: parseColor(s.color, el, 'color'),
+            radius: px(s.borderRadius),
+            font_size: px(s.fontSize),
+            font_weight: Number.parseInt(s.fontWeight) || 400,
+            line_height: px(s.lineHeight) || (px(s.fontSize) * 1.5),
+          }
+        };
+      });
     }
     """
-
-    elements = await page.evaluate(js_script)
-    return elements
+    return await page.evaluate(script)
 
 
-async def generate_dataset_from_urls(urls: List[str], output_dir: str, viewport_sizes: List[tuple] = None, split_name: str = 'train'):
-    """Generate dataset from a list of URLs using Playwright"""
+async def _capture_url(page, url: str, viewport: tuple, scroll_fractions: List[float],
+                       images_dir: Path, url_idx: int, split_name: str) -> List[Dict]:
+    vw, vh = viewport
+    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    await page.wait_for_timeout(1200)
+
+    scroll_height = await page.evaluate("Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)")
+    max_scroll = max(0, int(scroll_height) - vh)
+    scroll_positions = sorted({int(max_scroll * max(0.0, min(1.0, float(f)))) for f in scroll_fractions})
+
+    domain = extract_domain(url)
+    safe_domain = domain.replace(".", "_")
+    samples = []
+
+    for scroll_idx, scroll_y in enumerate(scroll_positions):
+        await page.evaluate("(y) => window.scrollTo(0, y)", scroll_y)
+        await page.wait_for_timeout(200)
+
+        elements = await extract_dom_elements(page)
+        if not elements:
+            continue
+
+        shot = await page.screenshot(full_page=False)
+        image = Image.open(io.BytesIO(shot)).convert("RGB")
+        image_name = f"{split_name}_{safe_domain}_{url_idx}_vp{vw}x{vh}_s{scroll_idx}.png"
+        image_path = images_dir / image_name
+        image.save(image_path)
+
+        ui_elements = []
+        for elem in elements:
+            x1, y1, x2, y2 = elem["bbox"]
+            norm = [
+                max(0.0, min(1.0, x1 / vw)),
+                max(0.0, min(1.0, y1 / vh)),
+                max(0.0, min(1.0, x2 / vw)),
+                max(0.0, min(1.0, y2 / vh)),
+            ]
+            if norm[2] - norm[0] <= 0.002 or norm[3] - norm[1] <= 0.002:
+                continue
+            ui_elements.append({
+                "element_id": elem["element_id"],
+                "parent_id": elem.get("parent_id"),
+                "bbox": norm,
+                "class_id": UI_CLASS_TO_IDX[elem["type"]],
+                "class_name": elem["type"],
+                "text": elem.get("text", ""),
+                "style": elem["style"],
+            })
+
+        if not ui_elements:
+            continue
+
+        samples.append({
+            "image_id": image_name[:-4],
+            "image_path": str(image_path),
+            "viewport": [vw, vh],
+            "scroll_y": scroll_y,
+            "domain": domain,
+            "url": url,
+            "split": split_name,
+            "ui_elements": ui_elements,
+            "source": "browser",
+        })
+    return samples
+
+
+async def generate_dataset_from_urls(urls: List[str], output_dir: str,
+                                     viewport_sizes: List[tuple],
+                                     scroll_fractions: List[float],
+                                     split_name: str) -> List[Dict]:
     from playwright.async_api import async_playwright
 
-    if viewport_sizes is None:
-        viewport_sizes = [(1440, 900), (1920, 1080), (1366, 768), (375, 667), (768, 1024)]
-
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    images_dir = output_path / 'images'
-    images_dir.mkdir(exist_ok=True)
-
-    all_samples = []
+    root = Path(output_dir)
+    images_dir = root / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+    samples: List[Dict] = []
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-
-        for url_idx, url in enumerate(tqdm(urls, desc=f"Processing {split_name} URLs")):
-            for vp_idx, (vw, vh) in enumerate(viewport_sizes):
-                context = await browser.new_context(viewport={'width': vw, 'height': vh}, device_scale_factor=1)
+        for url_idx, url in enumerate(tqdm(urls, desc=f"Rendering {split_name}")):
+            for viewport in viewport_sizes:
+                vw, vh = int(viewport[0]), int(viewport[1])
+                context = await browser.new_context(viewport={"width": vw, "height": vh}, device_scale_factor=1)
                 page = await context.new_page()
-
                 try:
-                    await page.goto(url, wait_until='networkidle', timeout=30000)
-                    await page.wait_for_load_state('networkidle')
-                    await asyncio.sleep(1)
-
-                    elements = await extract_dom_elements(page, vw, vh)
-
-                    if not elements:
-                        print(f"  No elements found for {url} @ {vw}x{vh}")
-                        await context.close()
-                        continue
-
-                    screenshot_bytes = await page.screenshot(full_page=False)
-                    import io
-                    screenshot = Image.open(io.BytesIO(screenshot_bytes))
-                    screenshot_np = np.array(screenshot)
-
-                    if screenshot_np.shape[2] == 4:
-                        screenshot_np = cv2.cvtColor(screenshot_np, cv2.COLOR_RGBA2RGB)
-
-                    domain = extract_domain(url).replace('.', '_')
-                    img_name = f"{domain}_{url_idx}_vp{vp_idx}.png"
-                    img_path = images_dir / img_name
-                    Image.fromarray(screenshot_np).save(img_path)
-
-                    ui_elements = []
-                    for i, elem in enumerate(elements):
-                        bbox = elem['bbox']
-                        norm_bbox = [bbox[0]/vw, bbox[1]/vh, bbox[2]/vw, bbox[3]/vh]
-                        norm_bbox = [max(0, min(1, x)) for x in norm_bbox]
-
-                        class_id = UI_CLASS_TO_IDX.get(elem['type'], UI_CLASS_TO_IDX['other'])
-
-                        def clean_str(s):
-                            if isinstance(s, str): return s.replace('\x00', '')
-                            return s
-
-                        ui_elements.append({
-                            'bbox': norm_bbox,
-                            'class_id': class_id,
-                            'class_name': clean_str(elem['type']),
-                            'text': clean_str(elem.get('text', '')),
-                            'parent_id': clean_str(elem.get('parent_id', '')) if elem.get('parent_id') else None,
-                            'style': elem['style']
-                        })
-
-                    sample = {
-                        'image_id': f"{domain}_{url_idx}_vp{vp_idx}",
-                        'image_path': str(img_path),
-                        'viewport': [vw, vh],
-                        'domain': domain,
-                        'url': url,
-                        'ui_elements': ui_elements,
-                        'source': 'browser'
-                    }
-                    all_samples.append(sample)
-                    print(f"  {url} @ {vw}x{vh}: {len(ui_elements)} elements")
-
-                except Exception as e:
-                    import traceback
-                    print(f"  Error processing {url} @ {vw}x{vh}: {e}")
-                    traceback.print_exc()
+                    samples.extend(await _capture_url(
+                        page, url, (vw, vh), scroll_fractions, images_dir, url_idx, split_name
+                    ))
+                except Exception as exc:
+                    print(f"[Gate2] skip {url} {vw}x{vh}: {exc}")
                 finally:
                     await context.close()
-
         await browser.close()
 
-    manifest_path = output_path / f'manifest_{split_name}.json'
-    with open(manifest_path, 'w') as f:
-        json.dump(all_samples, f, indent=2)
+    with open(root / f"manifest_{split_name}.json", "w") as f:
+        json.dump(samples, f, indent=2)
+    return samples
 
-    print(f"\nGenerated {len(all_samples)} {split_name} samples")
-    print(f"Manifest saved to {manifest_path}")
-    return all_samples
+
+def _load_manifest(path: Path) -> List[Dict]:
+    with open(path) as f:
+        return json.load(f)
 
 
 def create_web_ui_dataset(config: dict, force_regenerate: bool = False) -> List[Dict]:
-    """Create or load web UI dataset from browser-rendered pages with domain-based split"""
-    data_root = Path(config.get('data_root', 'data/web_ui'))
-    manifest_path = data_root / 'manifest.json'
+    """Create/load strict domain-separated browser dataset."""
+    root = Path(config.get("data_root", "./data/web_ui"))
+    root.mkdir(parents=True, exist_ok=True)
+    train_manifest = root / "manifest_train.json"
+    val_manifest = root / "manifest_val.json"
 
-    train_urls = config.get('train_urls', [])
-    val_urls = config.get('val_urls', [])
-
-    train_domains = [extract_domain(u) for u in train_urls]
-    val_domains = [extract_domain(u) for u in val_urls]
-
-    if not force_regenerate and manifest_path.exists():
-        print(f"Loading existing dataset from {manifest_path}")
-        with open(manifest_path) as f:
-            return json.load(f)
-
+    train_urls = list(config.get("train_urls", []))
+    val_urls = list(config.get("val_urls", []))
     if not train_urls or not val_urls:
-        urls = config.get('urls', [
-            'https://stripe.com', 'https://linear.app', 'https://vercel.com',
-            'https://github.com', 'https://tailwindcss.com', 'https://react.dev',
-            'https://nextjs.org', 'https://figma.com', 'https://notion.so', 'https://airbnb.com',
-        ])
-        viewport_sizes = config.get('viewport_sizes', [(1440, 900), (1920, 1080), (1366, 768), (375, 667), (768, 1024)])
-        print(f"Generating dataset from {len(urls)} URLs x {len(viewport_sizes)} viewports")
-        return asyncio.run(generate_dataset_from_urls(urls, str(data_root), viewport_sizes))
+        raise RuntimeError("Gate 2 requires non-empty train_urls and val_urls")
 
-    viewport_sizes = config.get('viewport_sizes', [(1440, 900), (1920, 1080), (1366, 768), (375, 667), (768, 1024)])
+    train_domains = sorted({extract_domain(u) for u in train_urls})
+    val_domains = sorted({extract_domain(u) for u in val_urls})
+    overlap = sorted(set(train_domains) & set(val_domains))
+    if overlap:
+        raise RuntimeError(f"Gate 2 domain leakage: {overlap}")
 
-    print(f"Generating TRAIN dataset from {len(train_urls)} URLs...")
-    train_samples = asyncio.run(generate_dataset_from_urls(train_urls, str(data_root), viewport_sizes, 'train'))
+    viewports = [tuple(v) for v in config.get("viewport_sizes", [(1440, 900)])]
+    scroll_fractions = list(config.get("scroll_fractions", [0.0]))
 
-    print(f"Generating VAL dataset from {len(val_urls)} URLs...")
-    val_samples = asyncio.run(generate_dataset_from_urls(val_urls, str(data_root), viewport_sizes, 'val'))
+    if force_regenerate or not train_manifest.exists():
+        train = asyncio.run(generate_dataset_from_urls(
+            train_urls, str(root), viewports, scroll_fractions, "train"
+        ))
+    else:
+        train = _load_manifest(train_manifest)
 
-    all_samples = train_samples + val_samples
+    if force_regenerate or not val_manifest.exists():
+        val = asyncio.run(generate_dataset_from_urls(
+            val_urls, str(root), viewports, scroll_fractions, "val"
+        ))
+    else:
+        val = _load_manifest(val_manifest)
 
-    with open(manifest_path, 'w') as f:
-        json.dump(all_samples, f, indent=2)
+    with open(root / "train_domains.json", "w") as f:
+        json.dump(train_domains, f, indent=2)
+    with open(root / "val_domains.json", "w") as f:
+        json.dump(val_domains, f, indent=2)
+    with open(root / "domain_split.json", "w") as f:
+        json.dump({
+            "train_domains": train_domains,
+            "val_domains": val_domains,
+            "train_count": len(train),
+            "val_count": len(val),
+        }, f, indent=2)
 
-    split_info = {'train_domains': train_domains, 'val_domains': val_domains, 'train_count': len(train_samples), 'val_count': len(val_samples)}
-    with open(data_root / 'domain_split.json', 'w') as f:
-        json.dump(split_info, f, indent=2)
-
-    print(f"\nTotal: {len(all_samples)} samples (train: {len(train_samples)}, val: {len(val_samples)})")
-    return all_samples
+    return train + val
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     import yaml
-    with open('configs/gate2.yaml') as f:
-        config = yaml.safe_load(f)
-    create_web_ui_dataset(config, force_regenerate=True)
+    with open("configs/gate2.yaml") as f:
+        cfg = yaml.safe_load(f)
+    data = create_web_ui_dataset(cfg, force_regenerate=True)
+    print(f"Generated {len(data)} screenshots")
