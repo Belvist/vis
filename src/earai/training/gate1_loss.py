@@ -166,13 +166,10 @@ class Gate1Loss(nn.Module):
             cost_bbox=lambda_bbox,
             cost_giou=lambda_giou
         )
-        
-        # CLIP projection (trainable, part of model)
-        self.clip_proj = nn.Linear(256, 512)
     
     def forward(self,
                 student_tokens: torch.Tensor,      # [B, N, 256]
-                student_out: Dict,                  # decoder output
+                student_out: Dict,                  # decoder output (includes clip_proj)
                 teacher_out: Dict) -> Dict:
         """
         Compute Gate 1 loss.
@@ -183,6 +180,7 @@ class Gate1Loss(nn.Module):
         pred_logits = student_out['class_logits']      # [B, N, C+1]
         pred_boxes = student_out['bboxes_xyxy']        # [B, N, 4] normalized xyxy
         pred_obj = student_out['objectness']           # [B, N]
+        student_clip = student_out['clip_proj']        # [B, 512] from decoder
         
         # Teacher detections
         teacher_dets = teacher_out['detections']       # List[Dict]
@@ -225,13 +223,13 @@ class Gate1Loss(nn.Module):
             # Class loss (cross entropy)
             loss_class += F.cross_entropy(pred_logits_matched, target_labels)
             
-            # Bbox L1 loss
-            loss_bbox += F.l1_loss(pred_boxes_matched, target_boxes)
+            # Bbox L1 loss - use sum, normalize once at the end
+            loss_bbox += F.l1_loss(pred_boxes_matched, target_boxes, reduction="sum")
             
-            # GIoU loss - only on matched pairs (diagonal)
+            # GIoU loss - only on matched pairs (diagonal), use sum
             giou_matrix = generalized_box_iou(pred_boxes_matched, target_boxes)  # [M, M]
             giou_diag = torch.diag(giou_matrix)  # [M]
-            loss_giou += (1 - giou_diag).mean()
+            loss_giou += (1 - giou_diag).sum()
             
             # Objectness loss (matched = 1)
             loss_objectness += F.binary_cross_entropy(
@@ -255,14 +253,13 @@ class Gate1Loss(nn.Module):
                 )
         
         # Normalize by number of matched objects (or batch size)
-        norm = max(num_matched, B)
+        norm = max(num_matched, 1)
         loss_class = loss_class / B
-        loss_bbox = loss_bbox / max(num_matched, 1)
-        loss_giou = loss_giou / max(num_matched, 1)
+        loss_bbox = loss_bbox / norm
+        loss_giou = loss_giou / norm
         loss_objectness = loss_objectness / B
         
         # CLIP alignment loss
-        student_clip = self.clip_proj(student_tokens.mean(dim=1))  # [B, 512]
         loss_clip = F.mse_loss(student_clip, teacher_clip)
         
         # Total loss

@@ -9,11 +9,11 @@ from pathlib import Path
 from tqdm import tqdm
 from typing import Dict, List
 
-from earai.training.student import create_student_model
+from earai.training.gate1_student import create_gate1_student
 from earai.training.gate1_teachers import create_gate1_teachers
 from earai.training.gate1_loss import create_gate1_loss
 from earai.training.gate1_dataset import create_gate1_dataloader
-from earai.decoder.heads import create_decoder
+from earai.training.gate1_decoder import create_gate1_decoder
 
 
 def box_iou(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
@@ -80,19 +80,21 @@ def compute_metrics(pred_boxes: torch.Tensor, pred_labels: torch.Tensor, pred_ob
         for p_idx, t_idx in zip(pred_idx, target_idx):
             if p_idx < num_pred and t_idx < num_gt:
                 iou = ious[p_idx, t_idx].item()
+                # Always mark as matched (to avoid double-counting)
+                matched_gt.add(t_idx)
+                matched_pred.add(p_idx)
+                
                 # Only count as TP if IoU >= 0.5
                 if iou >= 0.5:
                     tp += 1
                     all_ious.append(iou)
-                    matched_gt.add(t_idx)
-                    matched_pred.add(p_idx)
                     
                     # Class accuracy on matched
                     if pred_labels_b[p_idx].item() == gt_labels[t_idx].item():
                         correct_class += 1
                     total_class += 1
                 else:
-                    # Low IoU = FP + FN
+                    # Low IoU = FP + FN (but already marked as matched)
                     fp += 1
                     fn += 1
         
@@ -129,26 +131,25 @@ class Gate1Trainer:
         
         # Models
         print("Creating student...")
-        self.student = create_student_model(config).to(self.device)
+        self.student = create_gate1_student(config).to(self.device)
         print(f"Student params: {sum(p.numel() for p in self.student.parameters())/1e6:.2f}M")
         
         print("Creating decoder...")
-        self.decoder = create_decoder(config).to(self.device)
+        self.decoder = create_gate1_decoder(config).to(self.device)
         print(f"Decoder params: {sum(p.numel() for p in self.decoder.parameters())/1e6:.2f}M")
         
         print("Loading teachers...")
         self.teachers, _ = create_gate1_teachers(device)
         
-        # Loss (includes clip_proj)
+        # Loss (no clip_proj - it's in decoder now)
         print("Creating loss...")
         self.loss_fn = create_gate1_loss(config).to(self.device)
         
-        # Optimizer - INCLUDE loss_fn.clip_proj
+        # Optimizer - INCLUDE decoder.clip_proj
         print("Creating optimizer...")
         self.optimizer = torch.optim.AdamW(
             list(self.student.parameters()) + 
-            list(self.decoder.parameters()) + 
-            list(self.loss_fn.clip_proj.parameters()),
+            list(self.decoder.parameters()),
             lr=config.get('lr', 0.0001),
             weight_decay=config.get('weight_decay', 0.0001)
         )

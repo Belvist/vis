@@ -23,6 +23,10 @@ GATE1_IMAGE_IDS = [
     515982, 446117, 511453, 193181, 306893, 539883, 522393, 442993
 ]
 
+# Verify exactly 64 unique IDs
+assert len(GATE1_IMAGE_IDS) == 64, f"Expected 64 IDs, got {len(GATE1_IMAGE_IDS)}"
+assert len(set(GATE1_IMAGE_IDS)) == 64, "Duplicate IDs found!"
+
 # COCO category names (canonical 0-79)
 COCO_CATEGORIES = [
     'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat', 'traffic light',
