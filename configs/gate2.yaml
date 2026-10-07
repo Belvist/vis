@@ -1,0 +1,29 @@
+# Gate 2 Overfit Config - UI Screenshot Understanding
+# Target: Learn UI components from screenshots
+
+# Model
+feature_dim: 256
+num_scene_tokens: 16
+num_ui_classes: 15
+style_dim: 8
+
+# Backbone
+backbone_pretrained: true
+peripheral_resolution: [224, 224]
+fovea_resolution: [600, 600]
+max_entities: 50
+
+# Training
+batch_size: 8
+num_workers: 0
+lr: 0.0001
+weight_decay: 0.0001
+epochs: 100
+eval_every: 10
+
+# Data
+data_root: "./data/rico"
+split: "train"
+
+# Device
+device: "auto"
