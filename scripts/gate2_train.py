@@ -283,7 +283,7 @@ class Gate2Trainer:
         # Compute metrics
         metrics = compute_metrics(
             all_pred_boxes, all_pred_labels, all_pred_obj, all_pred_style,
-            all_target_boxes, all_target_labels, target_styles
+            all_target_boxes, all_target_labels, all_target_styles
         )
         
         return metrics

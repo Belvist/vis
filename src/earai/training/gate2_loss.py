@@ -218,11 +218,17 @@ class Gate2Loss(nn.Module):
             num_matched += len(pred_idx)
 
             if pred_style is not None:
-                for i, (pred_s, target_s) in enumerate(zip(pred_style[b, pred_idx], [target_elements[i].get('style', {}) for i in target_idx])):
-                    if 'bg_color' in target_elements[i].get('style', {}):
-                        target_bg = torch.tensor(target_elements[i]['style']['bg_color'], device=pred_style.device, dtype=torch.float32)
-                        loss_style += F.mse_loss(pred_style[b, pred_idx[i], :3], target_bg)
-                    # ... style loss continued
+                # target_styles is a list of tensors [M, 10] from dataset
+                target_style_tensors = [target_styles[i] for i in target_idx]
+                if target_style_tensors:
+                    target_style_tensor = torch.stack(target_style_tensors)  # [M, 10]
+                    # MSE loss on style vectors
+                    pred_style_matched = pred_style[b, pred_idx]  # [M, 8 or 10]
+                    min_dim = min(pred_style_matched.shape[1], target_style_tensor.shape[1])
+                    loss_style += F.mse_loss(
+                        pred_style_matched[:, :min_dim],
+                        target_style_tensor[:, :min_dim]
+                    )
 
             all_pred_idx = torch.arange(N, device=pred_logits.device)
             unmatched = all_pred_idx[~torch.isin(all_pred_idx, pred_idx)]

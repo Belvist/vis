@@ -21,9 +21,33 @@ weight_decay: 0.0001
 epochs: 100
 eval_every: 10
 
-# Data
-data_root: "./data/rico"
+# Data - Browser-rendered web UI
+data_root: "./data/web_ui"
 split: "train"
+
+# Browser dataset URLs (will be rendered via Playwright)
+urls:
+  - "https://stripe.com"
+  - "https://linear.app"
+  - "https://vercel.com"
+  - "https://github.com"
+  - "https://tailwindcss.com"
+  - "https://react.dev"
+  - "https://nextjs.org"
+  - "https://figma.com"
+  - "https://notion.so"
+  - "https://airbnb.com"
+
+# Viewport sizes for responsive coverage
+viewport_sizes:
+  - [1440, 900]
+  - [1920, 1080]
+  - [1366, 768]
+  - [375, 667]
+  - [768, 1024]
 
 # Device
 device: "auto"
+
+# Force browser dataset generation (no COCO/synthetic fallback)
+force_browser_dataset: true
