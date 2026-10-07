@@ -65,7 +65,11 @@ class Gate1COCODataset(Dataset):
     
     def _load_coco(self):
         """Load COCO annotations"""
-        ann_file = self.coco_root / 'annotations' / f'instances_{self.split}.json'
+        # Handle both COCO structures: annotations/ or annotations/annotations/
+        ann_file = self.coco_root / 'annotations' / 'annotations' / f'instances_{self.split}.json'
+        if not ann_file.exists():
+            # Fallback to standard structure
+            ann_file = self.coco_root / 'annotations' / f'instances_{self.split}.json'
         if not ann_file.exists():
             raise RuntimeError(f"COCO annotations not found: {ann_file}")
         
@@ -92,7 +96,7 @@ class Gate1COCODataset(Dataset):
             # Limit objects
             valid_anns = valid_anns[:self.max_objects]
             
-            img_path = self.coco_root.parent / 'val2017' / img_info['file_name']
+            img_path = self.coco_root / 'val2017' / img_info['file_name']
             if img_path.exists():
                 samples.append({
                     'image_id': img_id,
