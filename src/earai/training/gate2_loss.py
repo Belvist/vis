@@ -112,7 +112,7 @@ class HungarianMatcher(nn.Module):
 class Gate2Loss(nn.Module):
     """
     Gate 2 Loss - UI-specific distillation losses:
-    L = L_type + 5×L_bbox + 2×L_giou + L_text + L_style + L_hierarchy + L_clip
+    L = L_type + 5×L_bbox + 2×L_giou + L_objectness + L_style + L_hierarchy + L_clip
     """
 
     def __init__(self,
@@ -121,7 +121,6 @@ class Gate2Loss(nn.Module):
                  lambda_bbox: float = 5.0,
                  lambda_giou: float = 2.0,
                  lambda_objectness: float = 1.0,
-                 lambda_text: float = 1.0,
                  lambda_style: float = 1.0,
                  lambda_hierarchy: float = 1.0,
                  lambda_clip: float = 1.0):
@@ -131,7 +130,6 @@ class Gate2Loss(nn.Module):
         self.lambda_bbox = lambda_bbox
         self.lambda_giou = lambda_giou
         self.lambda_objectness = lambda_objectness
-        self.lambda_text = lambda_text
         self.lambda_style = lambda_style
         self.lambda_hierarchy = lambda_hierarchy
         self.lambda_clip = lambda_clip
@@ -168,9 +166,8 @@ class Gate2Loss(nn.Module):
         loss_bbox = 0
         loss_giou = 0
         loss_objectness = 0
-        loss_text = 0
         loss_style = 0
-        loss_hierarchy = 0
+        loss_hierarchy = torch.tensor(0.0, device=pred_logits.device)
         num_matched = 0
 
         for b, (pred_idx, target_idx) in enumerate(indices):
@@ -189,6 +186,7 @@ class Gate2Loss(nn.Module):
             pred_boxes_matched = pred_boxes[b, pred_idx]
             pred_obj_matched = pred_obj[b, pred_idx]
             pred_style_matched = pred_style[b, pred_idx] if pred_style is not None else None
+            pred_hierarchy_matched = pred_hierarchy[b, pred_idx, :] if pred_hierarchy is not None else None
 
             target_elements = teacher_targets[b]['ui_elements']
             if not isinstance(target_elements, list):
@@ -203,33 +201,56 @@ class Gate2Loss(nn.Module):
                 dtype=torch.long, device=pred_logits.device
             )
             target_styles = [target_elements[i].get('style', {}) for i in target_idx]
+            target_parent_ids = [target_elements[i].get('parent_id') for i in target_idx]
 
+            # Class loss
             loss_type += F.cross_entropy(pred_logits[b, pred_idx], target_labels)
+
+            # Bbox L1 loss (sum, normalize at end)
             loss_bbox += F.l1_loss(pred_boxes[b, pred_idx], target_boxes, reduction='sum')
 
+            # GIoU loss - only on matched pairs (diagonal)
             giou_matrix = generalized_box_iou(pred_boxes[b, pred_idx], target_boxes)
             giou_diag = torch.diag(giou_matrix)
             loss_giou += (1 - giou_diag).sum()
 
+            # Objectness loss (matched = 1)
             loss_objectness += F.binary_cross_entropy(
                 pred_obj[b, pred_idx], torch.ones_like(pred_obj[b, pred_idx])
             )
 
             num_matched += len(pred_idx)
 
+            # Style loss - full 10 dims
             if pred_style is not None:
-                # target_styles is a list of tensors [M, 10] from dataset
+                # target_styles from dataset are already tensors [M, 10]
                 target_style_tensors = [target_styles[i] for i in target_idx]
                 if target_style_tensors:
                     target_style_tensor = torch.stack(target_style_tensors)  # [M, 10]
-                    # MSE loss on style vectors
-                    pred_style_matched = pred_style[b, pred_idx]  # [M, 8 or 10]
-                    min_dim = min(pred_style_matched.shape[1], target_style_tensor.shape[1])
-                    loss_style += F.mse_loss(
-                        pred_style_matched[:, :min_dim],
-                        target_style_tensor[:, :min_dim]
-                    )
+                    pred_style_matched = pred_style[b, pred_idx]  # [M, 10]
+                    loss_style += F.mse_loss(pred_style_matched, target_style_tensor)
 
+            # Hierarchy loss - predict parent relations
+            if pred_hierarchy is not None and len(target_parent_ids) > 1:
+                # Build parent relation matrix for matched queries
+                # pred_hierarchy: [N, N] - probability that i is parent of j
+                # We need to map parent_ids to matched query indices
+                parent_id_to_query_idx = {}
+                for q_idx, p_id in zip(pred_idx, target_parent_ids):
+                    if p_id is not None:
+                        parent_id_to_query_idx[p_id] = q_idx.item()
+
+                # For each matched query, find its parent among matched queries
+                for q_idx, p_id in zip(pred_idx, target_parent_ids):
+                    if p_id is not None and p_id in parent_id_to_query_idx:
+                        parent_q_idx = parent_id_to_query_idx[p_id]
+                        # pred_hierarchy[parent, child] should be high
+                        loss_hierarchy += F.binary_cross_entropy(
+                            pred_hierarchy[b, parent_q_idx, q_idx],
+                            torch.tensor(1.0, device=pred_hierarchy.device)
+                        )
+
+            # Unmatched predictions -> background
             all_pred_idx = torch.arange(N, device=pred_logits.device)
             unmatched = all_pred_idx[~torch.isin(all_pred_idx, pred_idx)]
 
@@ -248,7 +269,10 @@ class Gate2Loss(nn.Module):
         loss_bbox = loss_bbox / max(num_matched, 1)
         loss_giou = loss_giou / max(num_matched, 1)
         loss_objectness = loss_objectness / B
+        loss_style = loss_style / max(num_matched, 1)
+        loss_hierarchy = loss_hierarchy / max(num_matched, 1)
 
+        # CLIP alignment loss
         student_clip = student_out.get('clip_proj', None)
         if student_clip is not None:
             loss_clip = F.mse_loss(student_clip, teacher_out['clip_embeddings'])
@@ -284,7 +308,6 @@ def create_gate2_loss(config: dict) -> Gate2Loss:
         lambda_bbox=5.0,
         lambda_giou=2.0,
         lambda_objectness=1.0,
-        lambda_text=1.0,
         lambda_style=1.0,
         lambda_hierarchy=1.0,
         lambda_clip=1.0

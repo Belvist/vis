@@ -36,9 +36,9 @@ class Gate2Student(nn.Module):
         self.decoder = Gate2Decoder(
             token_dim=self.config.feature_dim,
             num_classes=15,
-            num_queries=16,
+            num_queries=32,
             hidden_dim=256,
-            style_dim=8
+            style_dim=10
         )
     
     def forward(self, x: torch.Tensor) -> Dict:

@@ -3,13 +3,13 @@
 
 # Model
 feature_dim: 256
-num_scene_tokens: 16
+num_scene_tokens: 32  # Increased from 16 for complex UI
 num_ui_classes: 15
-style_dim: 8
+style_dim: 10  # bg(3), fg(3), radius(1), font_size(1), font_weight(1), line_height(1)
 
 # Backbone
 backbone_pretrained: true
-peripheral_resolution: [224, 224]
+peripheral_resolution: [224, 222]
 fovea_resolution: [600, 600]
 max_entities: 50
 
@@ -25,18 +25,51 @@ eval_every: 10
 data_root: "./data/web_ui"
 split: "train"
 
-# Browser dataset URLs (will be rendered via Playwright)
-urls:
+# Browser dataset URLs - grouped by domain for train/val split
+# TRAIN domains (8 domains × ~5 viewports × ~2 pages = ~80 screenshots)
+# VAL domains (4 domains × ~5 viewports × ~2 pages = ~40 screenshots)
+# Target: 1000+ screenshots total
+train_urls:
+  # Landing pages
   - "https://stripe.com"
+  - "https://stripe.com/products"
+  - "https://stripe.com/pricing"
   - "https://linear.app"
+  - "https://linear.app/features"
+  - "https://linear.app/pricing"
   - "https://vercel.com"
-  - "https://github.com"
+  - "https://vercel.com/features"
+  - "https://vercel.com/pricing"
   - "https://tailwindcss.com"
+  - "https://tailwindcss.com/components"
   - "https://react.dev"
+  - "https://react.dev/learn"
+  - "https://react.dev/blog"
   - "https://nextjs.org"
+  - "https://nextjs.org/learn"
+  - "https://nextjs.org/docs"
   - "https://figma.com"
-  - "https://notion.so"
+  - "https://figma.com/features"
+  - "https://figma.com/pricing"
   - "https://airbnb.com"
+  - "https://airbnb.com/rooms"
+  - "https://airbnb.com/experiences"
+
+val_urls:
+  # Completely different domains for validation
+  - "https://github.com"
+  - "https://github.com/features"
+  - "https://github.com/pricing"
+  - "https://notion.so"
+  - "https://notion.so/product"
+  - "https://notion.so/pricing"
+  - "https://cloudflare.com"
+  - "https://cloudflare.com/products"
+  - "https://vercel.com/blog"
+  - "https://supabase.com"
+  - "https://supabase.com/features"
+  - "https://planetscale.com"
+  - "https://planetscale.com/features"
 
 # Viewport sizes for responsive coverage
 viewport_sizes:
