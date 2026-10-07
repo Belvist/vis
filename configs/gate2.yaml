@@ -1,36 +1,34 @@
-# Gate 2 Overfit Config - UI Screenshot Understanding
-# Target: Learn UI components from screenshots
+# Gate 2 - Web UI screenshot understanding
+# Browser/DOM provides exact training targets; EarAI sees screenshots only at runtime.
 
 # Model
 feature_dim: 256
-num_scene_tokens: 32  # Increased from 16 for complex UI
+num_scene_tokens: 32
 num_ui_classes: 15
-style_dim: 10  # bg(3), fg(3), radius(1), font_size(1), font_weight(1), line_height(1)
+style_dim: 10
+max_objects: 32
 
-# Backbone
+# Backbone/input
 backbone_pretrained: true
-peripheral_resolution: [224, 222]
+image_size: [224, 224]
+peripheral_resolution: [224, 224]
 fovea_resolution: [600, 600]
-max_entities: 50
+max_entities: 32
 
 # Training
 batch_size: 8
 num_workers: 0
 lr: 0.0001
 weight_decay: 0.0001
-epochs: 100
-eval_every: 10
+epochs: 50
+eval_every: 5
 
-# Data - Browser-rendered web UI
+# Data
 data_root: "./data/web_ui"
-split: "train"
+force_browser_dataset: false
 
-# Browser dataset URLs - grouped by domain for train/val split
-# TRAIN domains (8 domains × ~5 viewports × ~2 pages = ~80 screenshots)
-# VAL domains (4 domains × ~5 viewports × ~2 pages = ~40 screenshots)
-# Target: 1000+ screenshots total
+# Strict domain split: no domain may occur in both sets.
 train_urls:
-  # Landing pages
   - "https://stripe.com"
   - "https://stripe.com/products"
   - "https://stripe.com/pricing"
@@ -41,13 +39,13 @@ train_urls:
   - "https://vercel.com/features"
   - "https://vercel.com/pricing"
   - "https://tailwindcss.com"
-  - "https://tailwindcss.com/components"
+  - "https://tailwindcss.com/docs"
   - "https://react.dev"
   - "https://react.dev/learn"
-  - "https://react.dev/blog"
+  - "https://react.dev/reference/react"
   - "https://nextjs.org"
-  - "https://nextjs.org/learn"
   - "https://nextjs.org/docs"
+  - "https://nextjs.org/learn"
   - "https://figma.com"
   - "https://figma.com/features"
   - "https://figma.com/pricing"
@@ -56,7 +54,6 @@ train_urls:
   - "https://airbnb.com/experiences"
 
 val_urls:
-  # Completely different domains for validation
   - "https://github.com"
   - "https://github.com/features"
   - "https://github.com/pricing"
@@ -65,13 +62,11 @@ val_urls:
   - "https://notion.so/pricing"
   - "https://cloudflare.com"
   - "https://cloudflare.com/products"
-  - "https://vercel.com/blog"
   - "https://supabase.com"
   - "https://supabase.com/features"
   - "https://planetscale.com"
   - "https://planetscale.com/features"
 
-# Viewport sizes for responsive coverage
 viewport_sizes:
   - [1440, 900]
   - [1920, 1080]
@@ -79,8 +74,21 @@ viewport_sizes:
   - [375, 667]
   - [768, 1024]
 
-# Device
-device: "auto"
+# Capture several viewport states per page. This turns ~35 URLs into up to ~1000
+# real browser-rendered screenshots without mixing train and validation domains.
+scroll_fractions: [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
 
-# Force browser dataset generation (no COCO/synthetic fallback)
-force_browser_dataset: true
+# Refuse to claim Gate 2 on a tiny dataset.
+min_train_samples: 450
+min_val_samples: 180
+
+# Validation acceptance criteria (UNSEEN domains only)
+pass_precision: 0.85
+pass_recall: 0.85
+pass_class_accuracy: 0.90
+pass_mean_iou: 0.70
+pass_radius_mae_px: 4.0
+pass_font_size_mae_px: 3.0
+pass_parent_accuracy: 0.85
+
+device: "auto"
