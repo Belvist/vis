@@ -175,8 +175,10 @@ def gate2_collate_fn_cached(batch):
 
 
 def create_cached_dataloader(config: dict, cache: dict, device: str = "cpu",
-                             shuffle: bool = True, split: str = "train"):
+                             shuffle: bool = True, split: str = "train", drop_last: bool = None):
     dataset = CachedGate2Dataset(cache, config, split)
+    if drop_last is None:
+        drop_last = (split == "train")
     return torch.utils.data.DataLoader(
         dataset,
         batch_size=int(config.get("batch_size", 8)),
@@ -184,5 +186,5 @@ def create_cached_dataloader(config: dict, cache: dict, device: str = "cpu",
         num_workers=int(config.get("num_workers", 0)),
         pin_memory=False,
         collate_fn=gate2_collate_fn_cached,
-        drop_last=(split == "train"),
+        drop_last=drop_last,
     )

@@ -67,8 +67,8 @@ def main(config_path: str, regenerate: bool, smoke: bool):
     if overlap:
         raise RuntimeError(f"Domain leakage: {overlap}")
 
-    train_loader = create_cached_dataloader(cfg, cache, device, shuffle=False, split="train")
-    val_loader = create_cached_dataloader(cfg, cache, device, shuffle=False, split="val")
+    train_loader = create_cached_dataloader(cfg, cache, device, shuffle=False, split="train", drop_last=False)
+    val_loader = create_cached_dataloader(cfg, cache, device, shuffle=False, split="val", drop_last=False)
 
     model = create_gate2_student(cfg).to(device)
     loss_fn = create_gate2_loss(cfg).to(device)
