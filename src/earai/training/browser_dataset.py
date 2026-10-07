@@ -217,6 +217,23 @@ def _load_manifest(path: Path) -> List[Dict]:
         return json.load(f)
 
 
+def _manifest_valid(samples: List[Dict], split: str, allowed_domains: set) -> bool:
+    if not samples:
+        return False
+    for sample in samples:
+        if sample.get("split") != split:
+            return False
+        if sample.get("domain") not in allowed_domains:
+            return False
+        elems = sample.get("ui_elements")
+        if not isinstance(elems, list) or not elems:
+            return False
+        first = elems[0]
+        if "element_id" not in first or "parent_id" not in first:
+            return False
+    return True
+
+
 def create_web_ui_dataset(config: dict, force_regenerate: bool = False) -> List[Dict]:
     """Create/load strict domain-separated browser dataset."""
     root = Path(config.get("data_root", "./data/web_ui"))
@@ -238,19 +255,20 @@ def create_web_ui_dataset(config: dict, force_regenerate: bool = False) -> List[
     viewports = [tuple(v) for v in config.get("viewport_sizes", [(1440, 900)])]
     scroll_fractions = list(config.get("scroll_fractions", [0.0]))
 
-    if force_regenerate or not train_manifest.exists():
+    train_allowed = set(train_domains)
+    val_allowed = set(val_domains)
+
+    train = _load_manifest(train_manifest) if train_manifest.exists() else []
+    if force_regenerate or not _manifest_valid(train, "train", train_allowed):
         train = asyncio.run(generate_dataset_from_urls(
             train_urls, str(root), viewports, scroll_fractions, "train"
         ))
-    else:
-        train = _load_manifest(train_manifest)
 
-    if force_regenerate or not val_manifest.exists():
+    val = _load_manifest(val_manifest) if val_manifest.exists() else []
+    if force_regenerate or not _manifest_valid(val, "val", val_allowed):
         val = asyncio.run(generate_dataset_from_urls(
             val_urls, str(root), viewports, scroll_fractions, "val"
         ))
-    else:
-        val = _load_manifest(val_manifest)
 
     with open(root / "train_domains.json", "w") as f:
         json.dump(train_domains, f, indent=2)
