@@ -1,465 +1,370 @@
 #!/usr/bin/env python3
-"""Gate 2 Training - UI Screenshot Understanding"""
-import torch
-import torch.nn as nn
-import yaml
+"""Gate 2: train and validate UI understanding on unseen domains."""
+import argparse
+import copy
 import json
-import numpy as np
 from pathlib import Path
+
+import numpy as np
+import torch
+import yaml
+from scipy.optimize import linear_sum_assignment
 from tqdm import tqdm
-from typing import Dict, List
 
-from earai.training.gate2_student import create_gate2_student
-from earai.training.gate2_teachers import create_gate2_teachers
-from earai.training.gate2_loss import create_gate2_loss
-from earai.training.gate2_dataset import create_gate2_dataloader
+from earai.training.browser_dataset import UI_CLASSES
 from earai.training.gate2_cache import build_teacher_cache, create_cached_dataloader
-from earai.training.gate2_decoder import create_gate2_decoder
+from earai.training.gate2_loss import box_iou, create_gate2_loss
+from earai.training.gate2_student import create_gate2_student
 
 
-def compute_metrics(pred_boxes: torch.Tensor, pred_labels: torch.Tensor, pred_obj: torch.Tensor,
-                   pred_style: torch.Tensor, target_boxes: List[torch.Tensor], 
-                   target_labels: List[torch.Tensor], target_styles: List[List[Dict]],
-                   threshold: float = 0.5) -> Dict:
-    """
-    Compute precision, recall, F1, mean IoU, class accuracy, style MAE
-    """
-    all_ious = []
-    tp = 0
-    fp = 0
-    fn = 0
-    correct_class = 0
-    total_class = 0
-    style_errors = {'bg_color': [], 'fg_color': [], 'radius': [], 'font_size': []}
-    
-    for b in range(len(target_boxes)):
-        gt_boxes = target_boxes[b]
-        gt_labels = target_labels[b]
-        gt_styles = target_styles[b]
-        num_gt = len(gt_boxes)
-        
-        # Get predictions above threshold
-        pred_mask = pred_obj[b] >= 0.5
-        pred_boxes_b = pred_boxes[b][pred_mask]
-        pred_labels_b = pred_labels[b][pred_mask]
-        pred_obj_b = pred_obj[b][pred_mask]
-        pred_style_b = pred_style[b][pred_mask] if pred_style is not None else None
-        num_pred = len(pred_boxes_b)
-        
-        if num_gt == 0:
-            fp += num_pred
-            continue
-        
-        if num_pred == 0:
-            fn += num_gt
-            continue
-        
-        # IoU matrix
-        from earai.training.gate2_loss import box_iou
-        ious = box_iou(pred_boxes_b, gt_boxes)  # [P, G]
-        ious_np = ious.detach().cpu().numpy()
-        
-        # Hungarian assignment
-        from scipy.optimize import linear_sum_assignment
-        cost = -ious_np
-        pred_idx, target_idx = linear_sum_assignment(cost)
-        
-        matched_gt = set()
-        matched_pred = set()
-        
-        for p_idx, t_idx in zip(pred_idx, target_idx):
-            if p_idx < num_pred and t_idx < num_gt:
-                iou = ious[p_idx, t_idx].item()
-                # Always mark as matched
-                matched_gt.add(t_idx)
-                matched_pred.add(p_idx)
-                
-                if iou >= 0.5:
-                    tp += 1
-                    all_ious.append(iou)
-                    
-                    # Class accuracy
-                    if pred_labels_b[p_idx].item() == gt_labels[t_idx].item():
-                        correct_class += 1
-                    total_class += 1
-                    
-                    # Style MAE
-                    if pred_style_b is not None and t_idx < len(target_styles[b]):
-                        target_s = target_styles[b][t_idx]
-                        pred_s = pred_style_b[p_idx]
-                        if 'bg_color' in target_s:
-                            style_errors['bg_color'].append(
-                                np.mean(np.abs(pred_s[:3].cpu().numpy() - np.array(target_s['bg_color'])))
-                            )
-                        if 'fg_color' in target_s:
-                            style_errors['fg_color'].append(
-                                np.mean(np.abs(pred_s[3:6].cpu().numpy() - np.array(target_s['fg_color'])))
-                            )
-                        if 'radius' in target_s:
-                            style_errors['radius'].append(
-                                abs(pred_s[6].item() * 50 - target_s['radius'])
-                            )
-                        if 'font_size' in target_s:
-                            style_errors['font_size'].append(
-                                abs(pred_s[7].item() * 48 + 12 - target_s['font_size'])
-                            )
-                else:
-                    # Low IoU = FP + FN
+def _device(name: str) -> str:
+    if name != "auto":
+        return name
+    if torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
+def _teacher_targets(batch, device):
+    targets = []
+    for i in range(len(batch["boxes"])):
+        elems = []
+        for j in range(len(batch["boxes"][i])):
+            elems.append({
+                "bbox": batch["boxes"][i][j].to(device),
+                "class_id": batch["labels"][i][j].to(device),
+                "style": batch["styles"][i][j].to(device),
+                "element_id": batch["element_ids"][i][j],
+                "parent_id": batch["parent_ids"][i][j],
+            })
+        targets.append({"ui_elements": elems})
+    return {
+        "targets": targets,
+        "clip_embeddings": batch["clip_embeddings"].to(device),
+    }
+
+
+def _decode_style(v):
+    v = v.detach().cpu().float().numpy()
+    return {
+        "background": v[:3].tolist(),
+        "foreground": v[3:6].tolist(),
+        "radius": float(v[6] * 50.0),
+        "font_size": float(v[7] * 48.0 + 12.0),
+        "font_weight": float(v[8] * 800.0 + 100.0),
+        "line_height": float(v[9] * 48.0 + 12.0),
+    }
+
+
+def _mean(values, missing=1e9):
+    return float(np.mean(values)) if values else float(missing)
+
+
+def compute_metrics(outputs, batches):
+    ious_all = []
+    tp = fp = fn = 0
+    class_ok = class_n = 0
+    bg_err, fg_err = [], []
+    radius_err, font_err, weight_err, line_err = [], [], [], []
+    parent_ok = parent_n = 0
+
+    for out, batch in zip(outputs, batches):
+        pred_boxes_all = out["bboxes_xyxy"]
+        pred_labels_all = out["class_logits"].argmax(-1)
+        pred_obj_all = out["objectness"]
+        pred_style_all = out["style"]
+        pred_hier_all = out["hierarchy"]
+
+        for b in range(pred_boxes_all.shape[0]):
+            active = torch.nonzero(pred_obj_all[b] >= 0.5, as_tuple=False).flatten()
+            gt_boxes = batch["boxes"][b].to(pred_boxes_all.device)
+            gt_labels = batch["labels"][b].to(pred_boxes_all.device)
+            gt_styles = batch["styles"][b].to(pred_boxes_all.device)
+            gt_element_ids = batch["element_ids"][b]
+            gt_parent_ids = batch["parent_ids"][b]
+
+            if len(gt_boxes) == 0:
+                fp += len(active)
+                continue
+            if len(active) == 0:
+                fn += len(gt_boxes)
+                continue
+
+            pred_boxes = pred_boxes_all[b, active]
+            pred_labels = pred_labels_all[b, active]
+            pred_styles = pred_style_all[b, active]
+            ious = box_iou(pred_boxes, gt_boxes)
+            pi, ti = linear_sum_assignment((-ious).detach().cpu().numpy())
+
+            assigned_pred = set()
+            assigned_gt = set()
+            good_target_to_query = {}
+
+            for p, t in zip(pi, ti):
+                assigned_pred.add(int(p))
+                assigned_gt.add(int(t))
+                iou = float(ious[p, t].item())
+                if iou < 0.5:
                     fp += 1
                     fn += 1
-        
-        # Unmatched predictions = FP
-        fp += num_pred - len(matched_pred)
-        # Unmatched GT = FN
-        fn += num_gt - len(matched_gt)
-    
-    # Compute metrics
+                    continue
+
+                tp += 1
+                ious_all.append(iou)
+                query_idx = int(active[p].item())
+                good_target_to_query[int(t)] = query_idx
+
+                class_n += 1
+                if int(pred_labels[p].item()) == int(gt_labels[t].item()):
+                    class_ok += 1
+
+                ps = pred_styles[p]
+                ts = gt_styles[t]
+                bg_err.append(float(torch.mean(torch.abs(ps[:3] - ts[:3])).item()))
+                fg_err.append(float(torch.mean(torch.abs(ps[3:6] - ts[3:6])).item()))
+                radius_err.append(float(torch.abs(ps[6] - ts[6]).item() * 50.0))
+                font_err.append(float(torch.abs(ps[7] - ts[7]).item() * 48.0))
+                weight_err.append(float(torch.abs(ps[8] - ts[8]).item() * 800.0))
+                line_err.append(float(torch.abs(ps[9] - ts[9]).item() * 48.0))
+
+            fp += len(active) - len(assigned_pred)
+            fn += len(gt_boxes) - len(assigned_gt)
+
+            id_to_target = {
+                eid: i for i, eid in enumerate(gt_element_ids) if eid is not None
+            }
+            candidate_queries = list(good_target_to_query.values())
+            if candidate_queries:
+                candidate_tensor = torch.tensor(
+                    candidate_queries, device=pred_hier_all.device, dtype=torch.long
+                )
+                for child_t, child_q in good_target_to_query.items():
+                    parent_id = gt_parent_ids[child_t]
+                    parent_t = id_to_target.get(parent_id)
+                    if parent_t is None or parent_t not in good_target_to_query:
+                        continue
+                    expected_q = good_target_to_query[parent_t]
+                    scores = pred_hier_all[b, candidate_tensor, child_q]
+                    best_pos = int(torch.argmax(scores).item())
+                    predicted_q = candidate_queries[best_pos]
+                    parent_n += 1
+                    if float(scores[best_pos].item()) >= 0.5 and predicted_q == expected_q:
+                        parent_ok += 1
+
     precision = tp / max(tp + fp, 1)
     recall = tp / max(tp + fn, 1)
-    f1 = 2 * precision * recall / max(precision + recall, 1e-6)
-    mean_iou = np.mean(all_ious) if all_ious else 0.0
-    class_acc = correct_class / max(total_class, 1)
-    
-    style_mae = {k: float(np.mean(v)) if v else 0.0 for k, v in style_errors.items()}
-    
+    f1 = 2 * precision * recall / max(precision + recall, 1e-8)
     return {
-        'mean_iou': float(mean_iou),
-        'precision': float(precision),
-        'recall': float(recall),
-        'f1': float(f1),
-        'class_accuracy': float(class_acc),
-        'style_mae': style_mae,
-        'tp': tp,
-        'fp': fp,
-        'fn': fn
+        "mean_iou": _mean(ious_all, 0.0),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+        "class_accuracy": class_ok / max(class_n, 1),
+        "bg_color_mae": _mean(bg_err),
+        "fg_color_mae": _mean(fg_err),
+        "radius_mae_px": _mean(radius_err),
+        "font_size_mae_px": _mean(font_err),
+        "font_weight_mae": _mean(weight_err),
+        "line_height_mae_px": _mean(line_err),
+        "parent_relation_accuracy": parent_ok / max(parent_n, 1),
+        "parent_relations_evaluated": parent_n,
+        "tp": tp, "fp": fp, "fn": fn,
     }
+
+
+def passes_gate(metrics, config):
+    return (
+        metrics["precision"] >= float(config.get("pass_precision", 0.85)) and
+        metrics["recall"] >= float(config.get("pass_recall", 0.85)) and
+        metrics["class_accuracy"] >= float(config.get("pass_class_accuracy", 0.90)) and
+        metrics["mean_iou"] >= float(config.get("pass_mean_iou", 0.70)) and
+        metrics["radius_mae_px"] <= float(config.get("pass_radius_mae_px", 4.0)) and
+        metrics["font_size_mae_px"] <= float(config.get("pass_font_size_mae_px", 3.0)) and
+        metrics["parent_relation_accuracy"] >= float(config.get("pass_parent_accuracy", 0.85))
+    )
 
 
 class Gate2Trainer:
-    """Gate 2 Trainer with teacher caching"""
-    
-    def __init__(self, config: dict, device: str = 'cpu', teacher_cache: Dict = None):
+    def __init__(self, config, device, cache):
         self.config = config
         self.device = torch.device(device)
-        self.teacher_cache = teacher_cache
-        
-        # Models
-        print("Creating student...")
         self.student = create_gate2_student(config).to(self.device)
-        print(f"Student params: {sum(p.numel() for p in self.student.parameters())/1e6:.2f}M")
-        
-        print("Creating decoder...")
-        # Decoder is part of student now
-        self.decoder = self.student.decoder
-        print(f"Decoder params: {sum(p.numel() for p in self.decoder.parameters())/1e6:.2f}M")
-        
-        # Loss
-        print("Creating loss...")
         self.loss_fn = create_gate2_loss(config).to(self.device)
-        
-        # Optimizer
-        print("Creating optimizer...")
         self.optimizer = torch.optim.AdamW(
-            list(self.student.parameters()),
-            lr=config.get('lr', 0.0001),
-            weight_decay=config.get('weight_decay', 0.0001)
+            self.student.parameters(),
+            lr=float(config.get("lr", 1e-4)),
+            weight_decay=float(config.get("weight_decay", 1e-4)),
         )
-        
-        # Dataloader - use cached teacher targets
-        if teacher_cache is not None:
-            print("Creating cached dataloader...")
-            from earai.training.gate2_cache import create_cached_dataloader
-            self.train_loader = create_cached_dataloader(config, teacher_cache, self.device, shuffle=True)
-        else:
-            print("Creating dataloader (no cache)...")
-            from earai.training.gate2_dataset import create_gate2_dataloader
-            self.train_loader = create_gate2_dataloader(config, shuffle=True)
-        
-        # Metrics tracking
-        self.history = []
+        self.train_loader = create_cached_dataloader(
+            config, cache, device, shuffle=True, split="train"
+        )
+        self.val_loader = create_cached_dataloader(
+            config, cache, device, shuffle=False, split="val"
+        )
         self.initial_loss = None
-        self.best_f1 = 0
+        self.history = []
         self.best_state = None
-    
-    def train_step(self, batch: Dict) -> Dict:
-        """Single training step"""
+        self.best_f1 = -1.0
+
+    def train_epoch(self):
         self.student.train()
-        self.student.decoder.train()
-        self.loss_fn.train()
-        
-        student_imgs = batch['student'].to(self.device)
-        
-        # Teacher targets are already in batch (cached)
-        teacher_out = {
-            'targets': [
-                {
-                    'ui_elements': [
-                        {'bbox': b.to(self.device), 'class_id': l.to(self.device), 'style': s}
-                        for b, l, s in zip(batch['boxes'], batch['labels'], batch['styles'])
-                    ]
-                }
-                for b in range(len(batch['boxes']))
-            ],
-            'clip_embeddings': batch['clip_embeddings'].to(self.device)
-        }
-        
-        # Student forward
-        student_out = self.student(student_imgs)
-        
-        # Loss
-        losses = self.loss_fn(student_out['tokens'], student_out, teacher_out)
-        
-        # Backward
-        self.optimizer.zero_grad()
-        losses['total'].backward()
-        torch.nn.utils.clip_grad_norm_(
-            list(self.student.parameters()),
-            max_norm=1.0
-        )
-        self.optimizer.step()
-        
-        # Convert to scalars
-        return {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in losses.items()}
-    
-    @torch.no_grad()
-    def evaluate(self, save_predictions: bool = False) -> Dict:
-        """Evaluate on training set (overfit test)"""
-        self.student.eval()
-        
-        all_pred_boxes = []
-        all_pred_labels = []
-        all_pred_obj = []
-        all_pred_style = []
-        all_target_boxes = []
-        all_target_labels = []
-        all_target_styles = []
-        all_image_ids = []
-        
-        predictions_list = []
-        
-        for batch in self.train_loader:
-            # Teacher targets from cache
-            teacher_out = {
-                'targets': [
-                    {
-                        'ui_elements': [
-                            {'bbox': b.to(self.device), 'class_id': l.to(self.device), 'style': s}
-                            for b, l, s in zip(batch['boxes'], batch['labels'], batch['styles'])
-                        ]
-                    }
-                    for b in range(len(batch['boxes']))
-                ],
-                'clip_embeddings': batch['clip_embeddings'].to(self.device)
-            }
-            
-            # Student predictions
-            student_out = self.student(batch['student'].to(self.device))
-            
-            pred_boxes = student_out['bboxes_xyxy']     # [B, 16, 4]
-            pred_labels = student_out['class_logits'].argmax(-1)  # [B, 16]
-            pred_obj = student_out['objectness']        # [B, 16]
-            pred_style = student_out.get('style', None)        # [B, 16, 8]
-            
-            # Targets from cache
-            target_boxes = [b.to(self.device) for b in batch['boxes']]
-            target_labels = [l.to(self.device) for l in batch['labels']]
-            target_styles = batch['styles']
-            
-            all_pred_boxes.append(pred_boxes)
-            all_pred_labels.append(pred_labels)
-            all_pred_obj.append(pred_obj)
-            all_pred_style.append(pred_style)
-            all_target_boxes.extend(target_boxes)
-            all_target_labels.extend(target_labels)
-            all_target_styles.extend(target_styles)
-            all_image_ids.extend(batch['image_ids'])
-        
-        # Concat all predictions
-        all_pred_boxes = torch.cat(all_pred_boxes, dim=0)
-        all_pred_labels = torch.cat(all_pred_labels, dim=0)
-        all_pred_obj = torch.cat(all_pred_obj, dim=0)
-        all_pred_style = torch.cat(all_pred_style, dim=0) if all_pred_style[0] is not None else None
-        
-        # Compute metrics
-        metrics = compute_metrics(
-            all_pred_boxes, all_pred_labels, all_pred_obj, all_pred_style,
-            all_target_boxes, all_target_labels, all_target_styles
-        )
-        
-        return metrics
-    
-    def train_epoch(self) -> Dict:
-        """Train one epoch"""
-        epoch_losses = {}
-        
-        for batch in tqdm(self.train_loader, desc='Training'):
-            losses = self.train_step(batch)
-            
-            for k, v in losses.items():
-                epoch_losses.setdefault(k, []).append(v)
-        
-        # Average
-        avg_losses = {k: np.mean(v) for k, v in epoch_losses.items()}
-        
+        totals = {}
+        for batch in tqdm(self.train_loader, desc="Gate2 train"):
+            images = batch["student"].to(self.device)
+            out = self.student(images)
+            losses = self.loss_fn(out["tokens"], out, _teacher_targets(batch, self.device))
+            self.optimizer.zero_grad()
+            losses["total"].backward()
+            torch.nn.utils.clip_grad_norm_(self.student.parameters(), 1.0)
+            self.optimizer.step()
+
+            for key, value in losses.items():
+                if key == "num_matched":
+                    continue
+                totals.setdefault(key, []).append(float(value.detach().cpu().item()))
+
+        avg = {k: float(np.mean(v)) for k, v in totals.items()}
         if self.initial_loss is None:
-            self.initial_loss = avg_losses['total']
-        
-        self.history.append(avg_losses)
-        return avg_losses
-    
-    def save_checkpoint(self, path: str):
-        """Save model checkpoint"""
-        torch.save({
-            'student_state': self.student.state_dict(),
-            'loss_fn_state': self.loss_fn.state_dict(),
-            'optimizer_state': self.optimizer.state_dict(),
-            'config': self.config,
-            'history': self.history
-        }, path)
-    
-    def load_checkpoint(self, path: str):
-        """Load model checkpoint"""
-        ckpt = torch.load(path, map_location=self.device)
-        self.student.load_state_dict(ckpt['student_state'])
-        self.loss_fn.load_state_dict(ckpt['loss_fn_state'])
-        self.optimizer.load_state_dict(ckpt['optimizer_state'])
-        self.history = ckpt.get('history', [])
+            self.initial_loss = avg["total"]
+        self.history.append(avg)
+        return avg
+
+    @torch.no_grad()
+    def evaluate(self, loader, save_predictions=False):
+        self.student.eval()
+        outputs = []
+        batches = []
+        examples = []
+
+        for batch in loader:
+            out = self.student(batch["student"].to(self.device))
+            cpu_out = {
+                key: value.detach().cpu()
+                for key, value in out.items()
+                if torch.is_tensor(value)
+            }
+            outputs.append(cpu_out)
+            batches.append(batch)
+
+            if save_predictions and len(examples) < 20:
+                for b in range(len(batch["image_ids"])):
+                    if len(examples) >= 20:
+                        break
+                    pred_mask = cpu_out["objectness"][b] >= 0.5
+                    preds = []
+                    for q in torch.nonzero(pred_mask, as_tuple=False).flatten().tolist():
+                        cls = int(cpu_out["class_logits"][b, q].argmax().item())
+                        if cls >= len(UI_CLASSES):
+                            continue
+                        preds.append({
+                            "class": UI_CLASSES[cls],
+                            "bbox": cpu_out["bboxes_xyxy"][b, q].tolist(),
+                            "objectness": float(cpu_out["objectness"][b, q].item()),
+                            "style": _decode_style(cpu_out["style"][b, q]),
+                        })
+                    truth = []
+                    for j in range(len(batch["boxes"][b])):
+                        cls = int(batch["labels"][b][j].item())
+                        truth.append({
+                            "element_id": batch["element_ids"][b][j],
+                            "parent_id": batch["parent_ids"][b][j],
+                            "class": UI_CLASSES[cls],
+                            "bbox": batch["boxes"][b][j].tolist(),
+                            "text": batch["texts"][b][j],
+                            "style_normalized": batch["styles"][b][j].tolist(),
+                        })
+                    examples.append({
+                        "image_id": batch["image_ids"][b],
+                        "domain": batch["domains"][b],
+                        "url": batch["urls"][b],
+                        "truth": truth,
+                        "earai": preds,
+                    })
+
+        metrics = compute_metrics(outputs, batches)
+        return (metrics, examples) if save_predictions else metrics
 
 
-def run_gate2_overfit(config: dict, device: str = 'auto') -> Dict:
-    """Run Gate 2 overfit experiment with teacher caching"""
-    
-    # Auto-detect device
-    if device == 'auto':
-        if torch.backends.mps.is_available():
-            device = 'mps'
-        elif torch.cuda.is_available():
-            device = 'cuda'
-        else:
-            device = 'cpu'
-    
-    print("=" * 60)
-    print("GATE 2 OVERFIT PROOF - UI SCREENSHOT UNDERSTANDING")
-    print("=" * 60)
-    print(f"Device: {device}")
-    print(f"Epochs: {config.get('epochs', 100)}")
-    print(f"Batch size: {config.get('batch_size', 8)}")
-    print()
-    
-    # Build teacher cache (one-time)
-    print("Building/loading teacher cache...")
-    teacher_cache = build_teacher_cache(config, device='cpu')  # Teachers on CPU
-    
-    # Update config
-    config['device'] = device
-    
-    trainer = Gate2Trainer(config, device, teacher_cache)
-    
-    epochs = config.get('epochs', 100)
-    eval_every = config.get('eval_every', 10)
-    
+def main(config, requested_device="auto"):
+    device = _device(requested_device)
+    cache = build_teacher_cache(config, device="cpu")
+
+    min_train = int(config.get("min_train_samples", 0))
+    min_val = int(config.get("min_val_samples", 0))
+    if cache.get("train_count", 0) < min_train or cache.get("val_count", 0) < min_val:
+        raise RuntimeError(
+            f"Gate2 dataset too small: train={cache.get('train_count', 0)} "
+            f"val={cache.get('val_count', 0)}; required train>={min_train}, val>={min_val}"
+        )
+
+    trainer = Gate2Trainer(config, device, cache)
+    epochs = int(config.get("epochs", 50))
+    eval_every = int(config.get("eval_every", 5))
+    epochs_ran = 0
+
     for epoch in range(epochs):
-        # Train
-        train_losses = trainer.train_epoch()
-        print(f"\nEpoch {epoch}: {train_losses}")
-        
-        # Evaluate
+        train_loss = trainer.train_epoch()
+        epochs_ran = epoch + 1
+        print(f"Epoch {epoch}: {train_loss}")
+
         if epoch % eval_every == 0 or epoch == epochs - 1:
-            print("Evaluating...")
-            metrics = trainer.evaluate()
-            print(f"  Mean IoU: {metrics['mean_iou']:.4f}")
-            print(f"  Precision: {metrics['precision']:.4f}")
-            print(f"  Recall: {metrics['recall']:.4f}")
-            print(f"  F1: {metrics['f1']:.4f}")
-            print(f"  Class Acc: {metrics['class_accuracy']:.4f}")
-            print(f"  Style MAE: {metrics['style_mae']}")
-            
-            if metrics['f1'] > trainer.best_f1:
-                trainer.best_f1 = metrics['f1']
-                trainer.best_state = {
-                    'student': trainer.student.state_dict(),
-                    'loss_fn': trainer.loss_fn.state_dict(),
-                    'optimizer': trainer.optimizer.state_dict()
-                }
-    
-    # Final evaluation
-    print("\n" + "=" * 60)
-    print("FINAL EVALUATION")
-    print("=" * 60)
-    final_metrics = trainer.evaluate()
-    print(f"Initial Loss: {trainer.initial_loss:.4f}")
-    print(f"Final Loss: {trainer.history[-1]['total']:.4f}")
-    print(f"Mean IoU: {final_metrics['mean_iou']:.4f}")
-    print(f"Precision: {final_metrics['precision']:.4f}")
-    print(f"Recall: {final_metrics['recall']:.4f}")
-    print(f"F1: {final_metrics['f1']:.4f}")
-    print(f"Class Accuracy: {final_metrics['class_accuracy']:.4f}")
-    print(f"Style MAE: {final_metrics['style_mae']}")
-    
-    # PASS/FAIL criteria
-    pass_gate = (
-        final_metrics['mean_iou'] >= 0.70 and
-        final_metrics['class_accuracy'] >= 0.90 and
-        final_metrics['precision'] >= 0.90 and
-        final_metrics['recall'] >= 0.90
-    )
-    
-    result = {
-        'initial_loss': trainer.initial_loss,
-        'final_loss': trainer.history[-1]['total'],
-        'mean_iou': final_metrics['mean_iou'],
-        'class_accuracy': final_metrics['class_accuracy'],
-        'precision': final_metrics['precision'],
-        'recall': final_metrics['recall'],
-        'f1': final_metrics['f1'],
-        'style_mae': final_metrics['style_mae'],
-        'steps': len(trainer.history) * len(trainer.train_loader),
-        'epochs': epochs,
-        'PASS': pass_gate
+            val = trainer.evaluate(trainer.val_loader)
+            print(f"VAL {epoch}: {val}")
+            if val["f1"] > trainer.best_f1:
+                trainer.best_f1 = val["f1"]
+                trainer.best_state = copy.deepcopy(trainer.student.state_dict())
+            if passes_gate(val, config):
+                print("Gate 2 validation criteria reached; stopping early.")
+                break
+
+    if trainer.best_state is not None:
+        trainer.student.load_state_dict(trainer.best_state)
+
+    final_val, examples = trainer.evaluate(trainer.val_loader, save_predictions=True)
+    final_train = trainer.evaluate(trainer.train_loader)
+    passed = passes_gate(final_val, config)
+
+    artifacts = Path("artifacts")
+    artifacts.mkdir(exist_ok=True)
+    report = {
+        "device": device,
+        "epochs_ran": epochs_ran,
+        "train_samples": len(trainer.train_loader.dataset),
+        "val_samples": len(trainer.val_loader.dataset),
+        "initial_loss": trainer.initial_loss,
+        "final_train_loss": trainer.history[-1]["total"],
+        "train_metrics": final_train,
+        "val_metrics": final_val,
+        "PASS": passed,
     }
-    
-    # Save artifacts
-    artifacts_dir = Path('artifacts')
-    artifacts_dir.mkdir(exist_ok=True)
-    
-    with open(artifacts_dir / 'gate2_report.json', 'w') as f:
-        json.dump(result, f, indent=2)
-    
-    # Save best checkpoint
-    if trainer.best_state:
-        torch.save(trainer.best_state, artifacts_dir / 'gate2_best.pt')
-    
-    print(f"\nResult: {'PASS ✓' if pass_gate else 'FAIL ✗'}")
-    print(f"Report saved to: {artifacts_dir / 'gate2_report.json'}")
-    print(f"Best checkpoint saved to: {artifacts_dir / 'gate2_best.pt'}")
-    
-    return result
+    with open(artifacts / "gate2_report.json", "w") as f:
+        json.dump(report, f, indent=2)
+    with open(artifacts / "gate2_predictions.json", "w") as f:
+        json.dump(examples, f, indent=2)
+    torch.save(
+        {"student_state": trainer.student.state_dict(), "config": config, "report": report},
+        artifacts / "gate2_best.pt",
+    )
+
+    print(json.dumps(report, indent=2))
+    print("PASS" if passed else "FAIL")
+    return report
 
 
-if __name__ == '__main__':
-    import argparse
-    
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='configs/gate2.yaml')
-    parser.add_argument('--device', type=str, default='auto')
-    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument("--config", default="configs/gate2.yaml")
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--regenerate-dataset", action="store_true")
     args = parser.parse_args()
-    
+
     with open(args.config) as f:
-        config = yaml.safe_load(f)
-    
-    config['epochs'] = args.epochs
-    config['device'] = args.device
-    config['eval_every'] = 10
-    
-    result = run_gate2_overfit(config, args.device)
-    
-    # Print summary
-    print("\n" + "=" * 60)
-    print("GATE 2 RESULT SUMMARY")
-    print("=" * 60)
-    for k, v in result.items():
-        print(f"  {k}: {v}")
-    print(f"  gate2_report.json: artifacts/gate2_report.json")
-    print(f"  gate2_best.pt: artifacts/gate2_best.pt")
-    print("=" * 60)
+        cfg = yaml.safe_load(f)
+    if args.epochs is not None:
+        cfg["epochs"] = args.epochs
+    if args.regenerate_dataset:
+        cfg["force_browser_dataset"] = True
+    main(cfg, args.device)
