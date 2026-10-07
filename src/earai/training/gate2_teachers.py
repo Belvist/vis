@@ -41,15 +41,16 @@ class Gate2Teacher(nn.Module):
             self.clip_model = model
             self.clip_preprocess = preprocess
         except Exception as e:
-            print(f"CLIP load failed: {e}")
-            self.clip_model = None
-            self.clip_preprocess = None
+            raise RuntimeError(
+                "Gate 2 requires the CLIP teacher. Install the gate2 extra "
+                "(pip install -e '.[gate2]') before building the cache."
+            ) from e
     
     @torch.no_grad()
     def encode_clip(self, images: torch.Tensor) -> torch.Tensor:
         """Get CLIP image embeddings"""
         if self.clip_model is None:
-            return torch.zeros(len(images), 512, device=self.device)
+            raise RuntimeError("Gate 2 CLIP teacher is unavailable")
         
         with torch.no_grad():
             features = self.clip_model.encode_image(images)
