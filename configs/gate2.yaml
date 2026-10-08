@@ -3,10 +3,10 @@
 
 # Model
 feature_dim: 256
-num_scene_tokens: 32
+num_scene_tokens: 20  # Reduced from 32: match max_objects=24, leave 4 for background queries
 num_ui_classes: 15
 style_dim: 10
-max_objects: 32
+max_objects: 24  # Reduced from 32: meaningful targets only, creates background queries
 
 # Backbone/input
 backbone_pretrained: true
@@ -90,5 +90,31 @@ pass_mean_iou: 0.70
 pass_radius_mae_px: 4.0
 pass_font_size_mae_px: 3.0
 pass_parent_accuracy: 0.85
+
+# Class weights for focal loss (inverse frequency from train distribution, normalized)
+# paragraph 23.59%, icon 23.33%, button 17.13%, container 7.03%, section 5.85%
+# navbar 5.56%, image 5.12%, heading 3.79%, card 3.46%, hero 3.13%
+# footer 0.47%, input 0.77%, badge 0.23%, modal 0.55%
+# link excluded (noisy)
+class_weights:
+  - 5.0   # navbar
+  - 8.0   # hero
+  - 5.0   # section
+  - 3.5   # container
+  - 8.0   # card
+  - 1.5   # button
+  - 30.0  # input
+  - 5.0   # image
+  - 1.2   # icon
+  - 6.0   # heading
+  - 1.0   # paragraph (baseline)
+  - 100.0 # badge
+  - 50.0  # modal
+  - 50.0  # footer
+  - 0.0   # link (excluded)
+
+# Focal loss parameters
+focal_gamma: 2.0
+focal_alpha: 0.25
 
 device: "auto"

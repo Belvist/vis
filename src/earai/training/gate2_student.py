@@ -46,13 +46,14 @@ class Gate2Student(nn.Module):
             features_dict["F16"],
             features_dict["F32"],
         ]
-        token_result = self.token_pooler(features, return_attention=False)
-        tokens = token_result["tokens"] if isinstance(token_result, dict) else token_result
+        token_result = self.token_pooler(features, return_attention=True)
+        tokens = token_result["tokens"]
+        centroids = token_result.get("centroids")  # [B, num_tokens, 2]
         if tokens.shape[1] != self.num_tokens:
             raise RuntimeError(
                 f"Gate2 token contract broken: expected {self.num_tokens}, got {tokens.shape[1]}"
             )
-        return {"tokens": tokens, **self.decoder(tokens)}
+        return {"tokens": tokens, "centroids": centroids, **self.decoder(tokens)}
 
 
 def create_gate2_student(config: dict) -> nn.Module:

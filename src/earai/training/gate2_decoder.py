@@ -25,6 +25,9 @@ class Gate2ObjectDecoder(nn.Module):
         # Token-to-query projection
         self.query_proj = nn.Linear(token_dim, hidden_dim)
 
+        # Centroid projection for bbox initialization
+        self.centroid_proj = nn.Linear(2, hidden_dim)
+
         # Class prediction head
         self.class_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -77,9 +80,10 @@ class Gate2ObjectDecoder(nn.Module):
         y2 = cy + h / 2
         return torch.stack([x1, y1, x2, y2], dim=-1)
 
-    def forward(self, tokens: torch.Tensor) -> Dict:
+    def forward(self, tokens: torch.Tensor, centroids: torch.Tensor = None) -> Dict:
         """
         tokens: [B, N, D] visual tokens
+        centroids: [B, N, 2] normalized spatial centroids [0,1] from TokenLearner
         Returns: dict with class_logits, bboxes_xyxy, objectness, style, hierarchy, clip_proj
         """
         B, N, D = tokens.shape
@@ -89,6 +93,11 @@ class Gate2ObjectDecoder(nn.Module):
 
         # Project to query space
         queries = self.query_proj(tokens)  # [B, N, hidden_dim]
+
+        # Add centroid information to queries if available
+        if centroids is not None:
+            centroid_feat = self.centroid_proj(centroids)  # [B, N, hidden_dim]
+            queries = queries + centroid_feat
 
         # Predictions
         class_logits = self.class_head(queries)      # [B, N, num_classes+1]
@@ -142,12 +151,13 @@ class Gate2Decoder(nn.Module):
         )
 
     def forward(self,
-                tokens: torch.Tensor) -> Dict:
+                tokens: torch.Tensor,
+                centroids: torch.Tensor = None) -> Dict:
         """
         Full decode from visual tokens.
         Returns all predictions including clip_proj.
         """
-        return self.object_decoder(tokens)
+        return self.object_decoder(tokens, centroids=centroids)
 
 
 def create_gate2_decoder(config: dict) -> Gate2Decoder:

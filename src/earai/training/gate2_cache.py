@@ -25,7 +25,9 @@ def _cache_hash(config: dict) -> str:
         "val_urls": config.get("val_urls", []),
         "viewport_sizes": config.get("viewport_sizes", []),
         "scroll_fractions": config.get("scroll_fractions", []),
-        "max_objects": config.get("max_objects", 32),
+        "max_objects": config.get("max_objects", 24),
+        # DOM filter logic version - bump when extract_dom_elements/filter_meaningful_elements changes
+        "dom_filter_version": 2,
     }
     raw = json.dumps(relevant, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode()).hexdigest()[:20]
@@ -55,7 +57,7 @@ def build_teacher_cache(config: dict, device: str = "cpu",
 
     targets = []
     clip_embeddings = []
-    max_objects = int(config.get("max_objects", 32))
+    max_objects = int(config.get("max_objects", 24))
 
     with torch.no_grad():
         for sample in tqdm(samples, desc="Gate2 cache/CLIP"):
@@ -98,6 +100,25 @@ def build_teacher_cache(config: dict, device: str = "cpu",
     return cache
 
 
+def _resize_with_padding(image: Image.Image, target_size: tuple) -> Image.Image:
+    """Resize maintaining aspect ratio with center padding to target size."""
+    target_h, target_w = target_size
+    orig_w, orig_h = image.size
+    
+    scale = min(target_w / orig_w, target_h / orig_h)
+    new_w = int(orig_w * scale)
+    new_h = int(orig_h * scale)
+    
+    image = image.resize((new_w, new_h), Image.Resampling.BILINEAR)
+    
+    padded = Image.new('RGB', (target_w, target_h), (128, 128, 128))
+    left = (target_w - new_w) // 2
+    top = (target_h - new_h) // 2
+    padded.paste(image, (left, top))
+    
+    return padded
+
+
 def _style_vector(style: dict) -> list:
     vals = [
         *style.get("background", [0.5, 0.5, 0.5]),
@@ -113,8 +134,8 @@ def _style_vector(style: dict) -> list:
 class CachedGate2Dataset(torch.utils.data.Dataset):
     def __init__(self, cache: dict, config: dict, split: str):
         self.config = config
-        self.image_size = tuple(config.get("image_size", (224, 224)))
-        self.max_objects = int(config.get("max_objects", 32))
+        self.target_size = tuple(config.get("image_size", (224, 224)))
+        self.max_objects = int(config.get("max_objects", 24))
         self.indices = [i for i, t in enumerate(cache["targets"]) if t.get("split") == split]
         if not self.indices:
             raise RuntimeError(f"Gate 2 cache has no {split} samples")
@@ -122,11 +143,10 @@ class CachedGate2Dataset(torch.utils.data.Dataset):
         self.clip_embeddings = cache["clip_embeddings"]
 
         self.student_transform = T.Compose([
-            T.Resize(self.image_size),
             T.ToTensor(),
             T.Normalize(IMAGENET_MEAN, IMAGENET_STD),
         ])
-        self.raw_transform = T.Compose([T.Resize(self.image_size), T.ToTensor()])
+        self.raw_transform = T.Compose([T.ToTensor()])
 
     def __len__(self):
         return len(self.indices)
@@ -137,13 +157,19 @@ class CachedGate2Dataset(torch.utils.data.Dataset):
         image = Image.open(target["image_path"]).convert("RGB")
         elems = target["ui_elements"][:self.max_objects]
 
+        # Resize with aspect ratio preservation + padding
+        padded = _resize_with_padding(image, self.target_size)
+        
+        student_tensor = self.student_transform(padded)
+        raw_tensor = self.raw_transform(padded)
+
         boxes = [e["bbox"] for e in elems]
         labels = [int(e["class_id"]) for e in elems]
         styles = [_style_vector(e.get("style", {})) for e in elems]
 
         return {
-            "student": self.student_transform(image),
-            "raw": self.raw_transform(image),
+            "student": student_tensor,
+            "raw": raw_tensor,
             "boxes": torch.tensor(boxes, dtype=torch.float32) if boxes else torch.zeros(0, 4),
             "labels": torch.tensor(labels, dtype=torch.long) if labels else torch.zeros(0, dtype=torch.long),
             "styles": torch.tensor(styles, dtype=torch.float32) if styles else torch.zeros(0, 10),

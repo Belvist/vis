@@ -16,6 +16,15 @@ UI_CLASSES = [
 ]
 UI_CLASS_TO_IDX = {name: i for i, name in enumerate(UI_CLASSES)}
 
+# Classes considered "meaningful" for UI understanding (excludes noisy leaf elements)
+MEANINGFUL_CLASSES = {
+    "navbar", "hero", "section", "container", "card", "button", "input",
+    "image", "icon", "heading", "paragraph", "badge", "modal", "footer"
+}
+
+# Classes to deprioritize / filter out as noise
+NOISY_CLASSES = {"link"}  # links are too numerous and often not visual components
+
 
 def extract_domain(url: str) -> str:
     return urlparse(url).netloc.lower().removeprefix("www.")
@@ -92,12 +101,14 @@ async def extract_dom_elements(page) -> List[Dict]:
         let parent = el.parentElement;
         while (parent && !idMap.has(parent)) parent = parent.parentElement;
         const text = (el.innerText || '').replace(/\0/g, '').trim().replace(/\s+/g, ' ').slice(0, 240);
+        const area = r.width * r.height;
         return {
           element_id: 'e' + i,
           parent_id: parent ? idMap.get(parent) : null,
           type,
           bbox: [r.left, r.top, r.right, r.bottom],
           text,
+          area,
           style: {
             background: parseColor(s.backgroundColor, el, 'backgroundColor'),
             foreground: parseColor(s.color, el, 'color'),
@@ -113,8 +124,52 @@ async def extract_dom_elements(page) -> List[Dict]:
     return await page.evaluate(script)
 
 
+def filter_meaningful_elements(elements: List[Dict], max_objects: int = 24) -> List[Dict]:
+    """
+    Filter DOM elements to meaningful visual components.
+    
+    Priority:
+    1. Meaningful classes (navbar, hero, section, container, card, button, input, image, icon, heading, paragraph, badge, modal, footer)
+    2. Larger visual area (more visible)
+    3. Has text content
+    4. Not deeply nested duplicates
+    
+    Excludes: link (too noisy), tiny elements, nested duplicates
+    """
+    # Filter out noisy classes
+    meaningful = [e for e in elements if e["type"] in MEANINGFUL_CLASSES]
+    
+    # Sort by visual importance: area desc, has_text desc
+    meaningful.sort(key=lambda e: (e.get("area", 0), 1 if e.get("text") else 0), reverse=True)
+    
+    # Deduplicate: remove elements that are fully contained in another with same type
+    filtered = []
+    for e in meaningful:
+        bbox = e["bbox"]
+        is_duplicate = False
+        for f in filtered:
+            fb = f["bbox"]
+            # Check if e is contained in f (with small tolerance)
+            if (bbox[0] >= fb[0] - 2 and bbox[1] >= fb[1] - 2 and
+                bbox[2] <= fb[2] + 2 and bbox[3] <= fb[3] + 2 and
+                e["type"] == f["type"]):
+                is_duplicate = True
+                break
+        if not is_duplicate:
+            filtered.append(e)
+        if len(filtered) >= max_objects:
+            break
+    
+    # If we still have too many, take top by area
+    if len(filtered) > max_objects:
+        filtered = filtered[:max_objects]
+    
+    return filtered
+
+
 async def _capture_url(page, url: str, viewport: tuple, scroll_fractions: List[float],
-                       images_dir: Path, url_idx: int, split_name: str) -> List[Dict]:
+                       images_dir: Path, url_idx: int, split_name: str,
+                       max_objects: int = 24) -> List[Dict]:
     vw, vh = viewport
     await page.goto(url, wait_until="domcontentloaded", timeout=30000)
     await page.wait_for_timeout(1200)
@@ -132,6 +187,11 @@ async def _capture_url(page, url: str, viewport: tuple, scroll_fractions: List[f
         await page.wait_for_timeout(200)
 
         elements = await extract_dom_elements(page)
+        if not elements:
+            continue
+
+        # Filter to meaningful visual components
+        elements = filter_meaningful_elements(elements, max_objects=max_objects)
         if not elements:
             continue
 
@@ -182,7 +242,8 @@ async def _capture_url(page, url: str, viewport: tuple, scroll_fractions: List[f
 async def generate_dataset_from_urls(urls: List[str], output_dir: str,
                                      viewport_sizes: List[tuple],
                                      scroll_fractions: List[float],
-                                     split_name: str) -> List[Dict]:
+                                     split_name: str,
+                                     max_objects: int = 24) -> List[Dict]:
     from playwright.async_api import async_playwright
 
     root = Path(output_dir)
@@ -199,7 +260,8 @@ async def generate_dataset_from_urls(urls: List[str], output_dir: str,
                 page = await context.new_page()
                 try:
                     samples.extend(await _capture_url(
-                        page, url, (vw, vh), scroll_fractions, images_dir, url_idx, split_name
+                        page, url, (vw, vh), scroll_fractions, images_dir, url_idx, split_name,
+                        max_objects=max_objects
                     ))
                 except Exception as exc:
                     print(f"[Gate2] skip {url} {vw}x{vh}: {exc}")
@@ -254,6 +316,7 @@ def create_web_ui_dataset(config: dict, force_regenerate: bool = False) -> List[
 
     viewports = [tuple(v) for v in config.get("viewport_sizes", [(1440, 900)])]
     scroll_fractions = list(config.get("scroll_fractions", [0.0]))
+    max_objects = int(config.get("max_objects", 24))  # Meaningful targets limit
 
     train_allowed = set(train_domains)
     val_allowed = set(val_domains)
@@ -261,13 +324,15 @@ def create_web_ui_dataset(config: dict, force_regenerate: bool = False) -> List[
     train = _load_manifest(train_manifest) if train_manifest.exists() else []
     if force_regenerate or not _manifest_valid(train, "train", train_allowed):
         train = asyncio.run(generate_dataset_from_urls(
-            train_urls, str(root), viewports, scroll_fractions, "train"
+            train_urls, str(root), viewports, scroll_fractions, "train",
+            max_objects=max_objects
         ))
 
     val = _load_manifest(val_manifest) if val_manifest.exists() else []
     if force_regenerate or not _manifest_valid(val, "val", val_allowed):
         val = asyncio.run(generate_dataset_from_urls(
-            val_urls, str(root), viewports, scroll_fractions, "val"
+            val_urls, str(root), viewports, scroll_fractions, "val",
+            max_objects=max_objects
         ))
 
     with open(root / "train_domains.json", "w") as f:

@@ -84,11 +84,42 @@ class HungarianMatcher(nn.Module):
         return results
 
 
+def focal_cross_entropy(logits, targets, alpha=None, gamma=2.0, reduction='mean'):
+    """Focal loss for class imbalance."""
+    # If alpha provided, ensure it has correct length (num_classes + 1 for background)
+    if alpha is not None:
+        num_classes = logits.shape[-1]
+        if len(alpha) != num_classes:
+            # Pad with 1.0 for background class
+            alpha = torch.cat([alpha, torch.ones(1, device=alpha.device, dtype=alpha.dtype)])
+    ce_loss = F.cross_entropy(logits, targets, weight=alpha, reduction='none')
+    pt = torch.exp(-ce_loss)
+    focal_loss = ((1 - pt) ** gamma) * ce_loss
+    if reduction == 'mean':
+        return focal_loss.mean()
+    elif reduction == 'sum':
+        return focal_loss.sum()
+    return focal_loss
+
+
+def focal_bce_loss(pred, target, alpha=0.25, gamma=2.0, reduction='mean'):
+    """Focal BCE for objectness (handles class imbalance between obj/background)."""
+    bce = F.binary_cross_entropy(pred, target, reduction='none')
+    pt = torch.exp(-bce)
+    focal = alpha * (1 - pt) ** gamma * bce * target + (1 - alpha) * pt ** gamma * bce * (1 - target)
+    if reduction == 'mean':
+        return focal.mean()
+    elif reduction == 'sum':
+        return focal.sum()
+    return focal
+
+
 class Gate2Loss(nn.Module):
     def __init__(self, num_classes=15, style_dim=10,
                  lambda_type=1.0, lambda_bbox=5.0, lambda_giou=2.0,
                  lambda_objectness=1.0, lambda_style=1.0,
-                 lambda_hierarchy=1.0, lambda_clip=1.0):
+                 lambda_hierarchy=1.0, lambda_clip=1.0,
+                 class_weights=None):
         super().__init__()
         self.num_classes = int(num_classes)
         self.style_dim = int(style_dim)
@@ -99,6 +130,13 @@ class Gate2Loss(nn.Module):
         self.lambda_style = float(lambda_style)
         self.lambda_hierarchy = float(lambda_hierarchy)
         self.lambda_clip = float(lambda_clip)
+        
+        # Class weights for imbalanced classes (register as buffer)
+        if class_weights is not None:
+            self.register_buffer('class_weights', torch.tensor(class_weights, dtype=torch.float32))
+        else:
+            self.class_weights = None
+            
         self.matcher = HungarianMatcher(lambda_type, lambda_bbox, lambda_giou)
 
     def forward(self, student_tokens, student_out, teacher_out):
@@ -196,7 +234,14 @@ class Gate2Loss(nn.Module):
                     loss_hierarchy = loss_hierarchy + rel_loss
                     hierarchy_batches += 1
 
-            loss_type = loss_type + F.cross_entropy(logits[b], class_targets)
+            # Standard CE with class weights for imbalance
+            class_w = self.class_weights.to(logits.device) if self.class_weights is not None else None
+            if class_w is not None and class_w.shape[0] != logits.shape[-1]:
+                # Pad with 1.0 for background class
+                class_w = torch.cat([class_w, torch.ones(1, device=class_w.device, dtype=class_w.dtype)])
+            loss_type = loss_type + F.cross_entropy(logits[b], class_targets, weight=class_w)
+            
+            # BCE for objectness - matched=1, unmatched=0 (background)
             loss_obj = loss_obj + F.binary_cross_entropy(obj[b], obj_targets)
 
         matched_norm = max(matched_total, 1)
@@ -236,7 +281,17 @@ class Gate2Loss(nn.Module):
 
 
 def create_gate2_loss(config: dict) -> Gate2Loss:
+    # Default class weights based on diagnostics (inverse frequency)
+    class_weights = config.get("class_weights")
     return Gate2Loss(
         num_classes=int(config.get("num_ui_classes", 15)),
         style_dim=int(config.get("style_dim", 10)),
+        lambda_type=config.get("weight_type", 1.0),
+        lambda_bbox=config.get("weight_bbox", 5.0),
+        lambda_giou=config.get("weight_giou", 2.0),
+        lambda_objectness=config.get("weight_objectness", 1.0),
+        lambda_style=config.get("weight_style", 1.0),
+        lambda_hierarchy=config.get("weight_hierarchy", 1.0),
+        lambda_clip=config.get("weight_clip", 1.0),
+        class_weights=class_weights,
     )
