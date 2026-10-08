@@ -11,7 +11,29 @@ class MotionTransform:
     matrix: np.ndarray  # 2x2
     translation: np.ndarray  # 2
     confidence: float
-    
+
+    @classmethod
+    def from_pixel_affine(cls, affine: np.ndarray, width: int, height: int,
+                          confidence: float = 1.0) -> "MotionTransform":
+        """Convert pixel-coordinate affine to normalized-coordinate affine."""
+        size = np.array([width, height], dtype=np.float32)
+        if np.any(size <= 0):
+            raise ValueError("Image dimensions must be positive")
+        affine = np.asarray(affine, dtype=np.float32)
+        return cls(
+            matrix=affine[:, :2] * size[None, :] / size[:, None],
+            translation=affine[:, 2] / size,
+            confidence=confidence,
+        )
+
+    def to_pixel_affine(self, width: int, height: int) -> np.ndarray:
+        """Convert normalized-coordinate affine back to pixel coordinates."""
+        size = np.array([width, height], dtype=np.float32)
+        if np.any(size <= 0):
+            raise ValueError("Image dimensions must be positive")
+        matrix = self.matrix * size[:, None] / size[None, :]
+        return np.column_stack((matrix, self.translation * size)).astype(np.float32)
+
     def warp_points(self, points: np.ndarray) -> np.ndarray:
         """Warp points: (N, 2) -> (N, 2)"""
         return (points @ self.matrix.T) + self.translation
@@ -117,20 +139,17 @@ class MotionEstimator:
             self._reset(gray)
             return None
         
-        # M is 2x3: [A|t] where A is 2x2, t is 2x1
-        matrix = M[:, :2].astype(np.float32)
-        translation = M[:, 2].astype(np.float32)
-        
-        # Normalize translation to 0-1 coords
-        translation = translation / np.array([w // self.downsample, h // self.downsample], dtype=np.float32)
-        
+        # Normalize both the affine linear part and translation.
+        # Normalizing only translation breaks rotations on non-square frames.
         confidence = float(np.sum(inliers)) / len(valid)
-        
-        # Update for next frame
+        transform = MotionTransform.from_pixel_affine(
+            M, gray.shape[1], gray.shape[0], confidence
+        )
+
         self.prev_gray = gray
         self.prev_pts = cv2.goodFeaturesToTrack(gray, **self.feature_params)
-        
-        return MotionTransform(matrix, translation, confidence)
+
+        return transform
     
     def _reset(self, gray: np.ndarray):
         self.prev_gray = gray
