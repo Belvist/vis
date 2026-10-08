@@ -390,16 +390,20 @@ class EarAI:
         # 3. State update using previous state + delta features
         if self.prev_state is not None:
             prev_tokens = self.prev_state.scene_tokens.unsqueeze(0).to(self.device)
-            prev_centroids = self.prev_state.token_centroids.unsqueeze(0).to(self.device)
-            
-            # State update with residual features (NO full backbone)
+            prev_centroids_np = self.prev_state.token_centroids.cpu().numpy()
+            warped_centroids_np = np.clip(motion.warp_points(prev_centroids_np), 0.0, 1.0)
+            predicted_centroids = torch.as_tensor(
+                warped_centroids_np, device=self.device, dtype=prev_tokens.dtype
+            ).unsqueeze(0)
+
+            # Route ROI updates at motion-compensated locations, not stale coordinates.
             with torch.no_grad():
                 updated_tokens = self.state_updater(
                     predicted_state=prev_tokens,
-                    predicted_centroids=prev_centroids,
+                    predicted_centroids=predicted_centroids,
                     delta_features=delta_features,
                     delta_bboxes=torch.tensor(np.array([r.bbox for r in rois]), device=self.device).unsqueeze(0) if rois else torch.zeros((1, 0, 4), device=self.device),
-                    state_centroids=prev_centroids
+                    state_centroids=predicted_centroids
                 )
         else:
             # No previous state - this shouldn't happen in ROI_CORRECT, fallback to keyframe
@@ -427,6 +431,7 @@ class EarAI:
             text_regions=text_regions,
             changes=[],
             fovea_requests=[],
+            image_labels=list(self.image_labels),
             processing_time_ms=0,
             inference_mode="roi_correction",
             peripheral_resolution=self.config.peripheral_resolution
@@ -434,45 +439,25 @@ class EarAI:
         
         packet = self.scene_memory.update(packet)
         
-        # 9. Extract updated centroids from attention (if available)
-        # Since we don't run backbone in ROI_CORRECT, warp previous centroids with motion
-        updated_centroids = np.zeros((updated_tokens.shape[1], 2), dtype=np.float32)
-        if self.prev_state is not None and motion is not None:
-            prev_centroids_np = self.prev_state.token_centroids.cpu().numpy()
-            for i in range(len(prev_centroids_np)):
-                cx, cy = prev_centroids_np[i]
-                cx_new = cx * motion.matrix[0,0] + cy * motion.matrix[0,1] + motion.translation[0]
-                cy_new = cx * motion.matrix[1,0] + cy * motion.matrix[1,1] + motion.translation[1]
-                updated_centroids[i] = [cx_new, cy_new]
+        # 9. Persist motion-compensated token positions.
+        updated_centroids = warped_centroids_np.astype(np.float32)
+
+        # Fresh OCR boxes are already in the current frame; never warp them again.
+        if text_regions:
+            updated_text_regions = text_regions
         else:
-            # Fallback to previous centroids
-            if self.prev_state is not None:
-                updated_centroids = self.prev_state.token_centroids.cpu().numpy()
-        
-        # Warp text_regions with motion for NEXT frame
-        updated_text_regions = []
-        if text_regions and motion is not None:
-            for tr in text_regions:
-                warped_bbox = motion.warp_bbox(np.array([tr.bbox.x1, tr.bbox.y1, tr.bbox.x2, tr.bbox.y2]))
-                updated_text_regions.append(TextRegion(
+            updated_text_regions = [
+                TextRegion(
                     value=tr.value,
-                    bbox=BBox(*warped_bbox),
+                    bbox=BBox(*motion.warp_bbox(np.array([
+                        tr.bbox.x1, tr.bbox.y1, tr.bbox.x2, tr.bbox.y2
+                    ]))),
                     confidence=tr.confidence,
-                    language=tr.language
-                ))
-        else:
-            # Fallback: warp previous text_regions
-            updated_text_regions = []
-            if self.prev_state is not None and motion is not None:
-                for tr in self.prev_state.text_regions:
-                    warped_bbox = motion.warp_bbox(np.array([tr.bbox.x1, tr.bbox.y1, tr.bbox.x2, tr.bbox.y2]))
-                    updated_text_regions.append(TextRegion(
-                        value=tr.value,
-                        bbox=BBox(*warped_bbox),
-                        confidence=tr.confidence,
-                        language=tr.language
-                    ))
-        
+                    language=tr.language,
+                )
+                for tr in self.prev_state.text_regions
+            ]
+
         # 10. Update state
         new_state = VisualState(
             scene_tokens=torch.from_numpy(updated_tokens.cpu().numpy().squeeze(0)),
@@ -499,15 +484,6 @@ class EarAI:
             mode="roi_correction",
             decision="ROI_CORRECT"
         )
-        packet.processing_time_ms = processing_time
-        
-        return InferenceResult(
-            packet=packet,
-            backend_time_ms=processing_time,
-            mode="roi_correction",
-            decision="ROI_CORRECT"
-        )
-    
     def _reuse_inference(self, frame: np.ndarray, motion) -> InferenceResult:
             """Fast path: reuse previous state with motion compensation"""
             start = time.time()
@@ -516,12 +492,12 @@ class EarAI:
             if self.prev_state is not None:
                 # Warp token centroids
                 prev_centroids = self.prev_state.token_centroids.clone()
-                warped_centroids = torch.zeros_like(prev_centroids)
-                for i in range(len(prev_centroids)):
-                    cx, cy = prev_centroids[i]
-                    cx_new = cx * motion.matrix[0,0] + cy * motion.matrix[0,1] + motion.translation[0]
-                    cy_new = cx * motion.matrix[1,0] + cy * motion.matrix[1,1] + motion.translation[1]
-                    warped_centroids[i] = torch.tensor([cx_new, cy_new])
+                warped_np = np.clip(
+                    motion.warp_points(prev_centroids.cpu().numpy()), 0.0, 1.0
+                )
+                warped_centroids = torch.as_tensor(
+                    warped_np, dtype=prev_centroids.dtype
+                )
             
                 # Warp text regions
                 warped_text_regions = []
@@ -558,6 +534,7 @@ class EarAI:
                 text_regions=text_regions,
                 changes=[],
                 fovea_requests=[],
+                image_labels=list(self.image_labels),
                 processing_time_ms=(time.time() - start) * 1000,
                 inference_mode="reuse",
                 peripheral_resolution=self.config.peripheral_resolution
@@ -609,12 +586,26 @@ class EarAI:
             return text_regions
         try:
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            data = pytesseract.image_to_data(rgb, output_type=pytesseract.Output.DICT, lang='eng+rus')
+            lang = getattr(self, "_ocr_lang", "eng+rus")
+            try:
+                data = pytesseract.image_to_data(
+                    rgb, output_type=pytesseract.Output.DICT, lang=lang
+                )
+            except pytesseract.TesseractError:
+                if lang == "eng":
+                    raise
+                self._ocr_lang = "eng"  # Russian language pack may not be installed
+                data = pytesseract.image_to_data(
+                    rgb, output_type=pytesseract.Output.DICT, lang="eng"
+                )
             n_boxes = len(data['text'])
             h, w = frame.shape[:2]
             for i in range(n_boxes):
                 text = data['text'][i].strip()
-                conf = int(data['conf'][i]) if data['conf'][i] != '-1' else 0
+                try:
+                    conf = float(data["conf"][i])
+                except (ValueError, TypeError):
+                    continue
                 if text and conf > 30:
                     x, y, bw, bh = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
                     bbox = BBox(x / w, y / h, (x + bw) / w, (y + bh) / h)
@@ -642,6 +633,7 @@ class EarAI:
         self.prev_frame = None
         self.prev_state = None
         self.prev_frame_warped = None
+        self.image_labels = []
         self.frame_id = 0
 
 
