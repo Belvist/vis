@@ -98,6 +98,8 @@ class VisionPacket:
 
     # Foveated crops requested
     fovea_requests: list[dict] = field(default_factory=list)
+    # Scene-wide ImageNet classifier guesses. These are NOT localized entities.
+    image_labels: list[dict] = field(default_factory=list)
 
     # Metadata
     processing_time_ms: float = 0.0
@@ -110,6 +112,7 @@ class VisionPacket:
             "t": self.t,
             "frame_id": self.frame_id,
             "scene_summary": self._scene_summary(),
+            "image_labels": self.image_labels,
             "entities": [
                 {
                     "id": e.id,
@@ -138,6 +141,11 @@ class VisionPacket:
         parts = []
         if self.entities:
             parts.append(f"{len(self.entities)} objects: " + ", ".join(f"{e.class_name}(#{e.id})" for e in self.entities[:5]))
+        if self.image_labels:
+            parts.append(
+                "Image-level labels (not detections): " +
+                ", ".join(str(v["class"]) for v in self.image_labels[:3])
+            )
         if self.text_regions:
             parts.append(f"Text: {', '.join(t.value[:30] for t in self.text_regions[:3])}")
         if self.changes:
@@ -150,6 +158,7 @@ class VisionPacket:
             "t": self.t,
             "frame_id": self.frame_id,
             "scene_embedding": self.scene_embedding.tolist(),
+            "image_labels": self.image_labels,
             "entities": [
                 {
                     "id": e.id,
