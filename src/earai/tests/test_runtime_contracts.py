@@ -104,3 +104,21 @@ def test_ocr_accepts_fractional_tesseract_confidence(monkeypatch):
     )
     assert len(regions) == 1
     assert regions[0].confidence == pytest.approx(0.97125)
+
+
+def test_keyframe_smoke_on_cpu_without_pretrained_downloads(monkeypatch):
+    # This verifies the actual orchestrator path, not just isolated helpers.
+    ear = EarAI(EarAIConfig(
+        backbone_pretrained=False,
+        feature_dim=64,
+        peripheral_resolution=(96, 96),
+    ), device="cpu")
+    monkeypatch.setattr(ear, "_process_ocr_tesseract", lambda frame: [])
+    frame = np.zeros((96, 160, 3), dtype=np.uint8)
+    frame[25:70, 40:120] = (0, 140, 250)
+    result = ear.process_frame(frame, force_full=True)
+    assert result.decision == "KEYFRAME"
+    assert result.packet.frame_id == 1
+    assert result.packet.entities == []
+    assert result.packet.to_universal_api()["entities"] == []
+    assert all(label["scope"] == "whole_image" for label in result.packet.image_labels)
