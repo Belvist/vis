@@ -25,9 +25,9 @@ def _cache_hash(config: dict) -> str:
         "val_urls": config.get("val_urls", []),
         "viewport_sizes": config.get("viewport_sizes", []),
         "scroll_fractions": config.get("scroll_fractions", []),
-        "max_objects": config.get("max_objects", 24),
+        "max_objects": config.get("max_objects", 18),
         # DOM filter logic version - bump when extract_dom_elements/filter_meaningful_elements changes
-        "dom_filter_version": 3,
+        "dom_filter_version": 4,  # max_objects reduced to 18, objectness weight increased
         "clip_transform_version": 1,
     }
     raw = json.dumps(relevant, sort_keys=True, separators=(",", ":"))

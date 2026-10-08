@@ -6,7 +6,7 @@ feature_dim: 256
 num_scene_tokens: 32  # 24 maximum targets + 8 learnable background queries
 num_ui_classes: 15
 style_dim: 10
-max_objects: 24  # Reduced from 32: meaningful targets only, creates background queries
+max_objects: 18  # Reduced from 24: more background queries for objectness learning
 
 # Backbone/input
 backbone_pretrained: true
@@ -116,5 +116,8 @@ class_weights:
 # Focal loss parameters
 focal_gamma: 2.0
 focal_alpha: 0.25
+
+# Objectness loss weight - increased to force separation
+weight_objectness: 10.0
 
 device: "auto"

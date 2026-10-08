@@ -119,7 +119,8 @@ class Gate2Loss(nn.Module):
                  lambda_type=1.0, lambda_bbox=5.0, lambda_giou=2.0,
                  lambda_objectness=1.0, lambda_style=1.0,
                  lambda_hierarchy=1.0, lambda_clip=1.0,
-                 class_weights=None):
+                 class_weights=None,
+                 focal_alpha=0.25, focal_gamma=2.0):
         super().__init__()
         self.num_classes = int(num_classes)
         self.style_dim = int(style_dim)
@@ -130,6 +131,8 @@ class Gate2Loss(nn.Module):
         self.lambda_style = float(lambda_style)
         self.lambda_hierarchy = float(lambda_hierarchy)
         self.lambda_clip = float(lambda_clip)
+        self.focal_alpha = float(focal_alpha)
+        self.focal_gamma = float(focal_gamma)
         
         # Class weights for imbalanced classes (register as buffer)
         if class_weights is not None:
@@ -241,8 +244,8 @@ class Gate2Loss(nn.Module):
                 class_w = torch.cat([class_w, torch.ones(1, device=class_w.device, dtype=class_w.dtype)])
             loss_type = loss_type + F.cross_entropy(logits[b], class_targets, weight=class_w)
             
-            # BCE for objectness - matched=1, unmatched=0 (background)
-            loss_obj = loss_obj + F.binary_cross_entropy(obj[b], obj_targets)
+            # Focal BCE for objectness (handles obj/background imbalance)
+            loss_obj = loss_obj + focal_bce_loss(obj[b], obj_targets, alpha=self.focal_alpha, gamma=self.focal_gamma)
 
         matched_norm = max(matched_total, 1)
         loss_type = loss_type / B
@@ -294,4 +297,6 @@ def create_gate2_loss(config: dict) -> Gate2Loss:
         lambda_hierarchy=config.get("weight_hierarchy", 1.0),
         lambda_clip=config.get("weight_clip", 1.0),
         class_weights=class_weights,
+        focal_alpha=config.get("focal_alpha", 0.25),
+        focal_gamma=config.get("focal_gamma", 2.0),
     )
