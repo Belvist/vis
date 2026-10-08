@@ -127,6 +127,7 @@ class EarAI:
         self.prev_frame: Optional[np.ndarray] = None
         self.prev_state: Optional[VisualState] = None
         self.prev_frame_warped: Optional[np.ndarray] = None
+        self.image_labels: list[dict] = []  # Scene-level labels, never object detections
         
         # Preprocessing
         self.imagenet_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device)
@@ -287,10 +288,13 @@ class EarAI:
             global_embedding = backbone_out['global']  # [1, D]
             imagenet_logits = backbone_out.get('imagenet_logits')
             
-            # ImageNet entities
+            # ImageNet is a whole-image classifier, NOT a bounding-box detector.
+            # Do not fabricate object entities or arbitrary bounding boxes.
             entities = []
-            if imagenet_logits is not None:
-                entities = self._process_imagenet(imagenet_logits)
+            self.image_labels = (
+                self._classify_imagenet(imagenet_logits)
+                if imagenet_logits is not None else []
+            )
             
             # OCR
             text_regions = self._process_ocr_tesseract(frame)
@@ -334,6 +338,7 @@ class EarAI:
             text_regions=text_regions,
             changes=[],
             fovea_requests=fovea_requests,
+            image_labels=list(self.image_labels),
             processing_time_ms=(time.time() - start) * 1000,
             inference_mode="keyframe",
             peripheral_resolution=self.config.peripheral_resolution
@@ -569,55 +574,35 @@ class EarAI:
             )
     
     def _tokens_to_entities(self, tokens: torch.Tensor, uncertainties: np.ndarray) -> List[Entity]:
-        """Convert scene tokens to entities (placeholder - needs proper decoder)"""
-        entities = []
-        tokens_np = tokens.cpu().numpy().squeeze(0)  # [N, D]
-        
-        for i, (token, unc) in enumerate(zip(tokens_np, uncertainties)):
-            if unc < 0.5:  # Only confident tokens
-                entity = Entity(
-                    id=-1,
-                    bbox=BBox(0.25, 0.25, 0.75, 0.75),  # Placeholder
-                    visual_embedding=token.astype(np.float32),
-                    semantic_embedding=token.astype(np.float32),
-                    motion_vector=np.array([0.0, 0.0], dtype=np.float32),
-                    class_name="object",
-                    confidence=1.0 - unc,
-                    first_seen=time.time(),
-                    last_seen=time.time(),
-                    frames_tracked=1
-                )
-                entities.append(entity)
-        
-        return entities
-    
-    def _process_imagenet(self, imagenet_logits: torch.Tensor) -> List[Entity]:
-        entities = []
-        probs = torch.softmax(imagenet_logits.squeeze(), dim=-1)
-        top5 = torch.topk(probs, 5)
-        
-        for idx, conf in zip(top5.indices.tolist(), top5.values.tolist()):
-            if conf > 0.1:
-                if IMAGENET_CATEGORIES and idx < len(IMAGENET_CATEGORIES):
-                    class_name = IMAGENET_CATEGORIES[idx]
-                else:
-                    class_name = f"class_{idx}"
-                bbox = BBox(0.25, 0.25, 0.75, 0.75)
-                entity = Entity(
-                    id=-1,
-                    bbox=bbox,
-                    visual_embedding=np.zeros(256, dtype=np.float32),
-                    semantic_embedding=np.zeros(256, dtype=np.float32),
-                    motion_vector=np.array([0.0, 0.0], dtype=np.float32),
-                    class_name=class_name,
-                    confidence=float(conf),
-                    first_seen=time.time(),
-                    last_seen=time.time(),
-                    frames_tracked=1
-                )
-                entities.append(entity)
-        return entities
-    
+        """No detector head has been trained to output localized entities yet.
+
+        Visual tokens/uncertainty alone do NOT establish object boxes or labels.
+        Returning empty detections is safer than inventing a constant box.
+        """
+        return []
+
+    @torch.no_grad()
+    def _classify_imagenet(self, imagenet_logits: torch.Tensor) -> list[dict]:
+        """Image-wide ImageNet predictions, not object detections."""
+        probabilities = torch.softmax(imagenet_logits.reshape(-1), dim=0)
+        top = torch.topk(probabilities, min(5, probabilities.numel()))
+        labels = []
+        for index, confidence in zip(top.indices.tolist(), top.values.tolist()):
+            if confidence < 0.1:
+                continue
+            class_name = (
+                IMAGENET_CATEGORIES[index]
+                if IMAGENET_CATEGORIES and index < len(IMAGENET_CATEGORIES)
+                else f"imagenet_class_{index}"
+            )
+            labels.append({
+                "class": class_name,
+                "confidence": float(confidence),
+                "source_frame_id": self.frame_id,
+                "scope": "whole_image",
+            })
+        return labels
+
     def _process_ocr_tesseract(self, frame: np.ndarray) -> List[TextRegion]:
         text_regions = []
         if not TESSERACT_AVAILABLE:
