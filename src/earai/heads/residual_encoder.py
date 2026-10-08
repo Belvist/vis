@@ -337,13 +337,12 @@ def compute_residual_frame(frame_curr: np.ndarray,
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
     
-    # Apply valid mask if provided (to exclude warped borders)
+    # Invalid (newly exposed) camera borders are not scene changes.
     if valid_mask is not None:
-        binary = cv2.bitwise_and(binary, (valid_mask > 0).astype(np.uint8) * 255)
-    
-    # Connected components
-    num_labels, labels = cv2.connectedComponents(binary)
-    
+        valid = valid_mask > 0
+        binary = cv2.bitwise_and(binary, valid.astype(np.uint8) * 255)
+        magnitude = np.where(valid, magnitude, 0.0)
+
     return magnitude, binary
 
 
@@ -352,17 +351,15 @@ def warp_frame(frame: np.ndarray, transform) -> Tuple[np.ndarray, np.ndarray]:
     Returns: (warped frame, valid mask)
     """
     h, w = frame.shape[:2]
-    # Convert normalized transform to pixel coordinates
-    M = np.eye(3, dtype=np.float32)
-    M[:2, :2] = transform.matrix
-    M[:2, 2] = transform.translation * np.array([w, h])
+    # Includes the aspect-ratio conversion for rotation/shear on rectangular frames.
+    M = transform.to_pixel_affine(w, h)
     
     # Apply forward transform (prev -> current), NO WARP_INVERSE_MAP
-    warped = cv2.warpAffine(frame, M[:2], (w, h), flags=cv2.INTER_LINEAR)
+    warped = cv2.warpAffine(frame, M, (w, h), flags=cv2.INTER_LINEAR)
     
     # Create valid mask (areas that came from valid source pixels)
     valid_mask = np.ones((h, w), dtype=np.uint8)
-    warped_mask = cv2.warpAffine(valid_mask, M[:2], (w, h), 
+    warped_mask = cv2.warpAffine(valid_mask, M, (w, h), 
                                  flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     
     return warped, warped_mask
