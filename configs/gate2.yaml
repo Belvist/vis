@@ -3,7 +3,7 @@
 
 # Model
 feature_dim: 256
-num_scene_tokens: 20  # Reduced from 32: match max_objects=24, leave 4 for background queries
+num_scene_tokens: 32  # 24 maximum targets + 8 learnable background queries
 num_ui_classes: 15
 style_dim: 10
 max_objects: 24  # Reduced from 32: meaningful targets only, creates background queries
