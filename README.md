@@ -38,8 +38,12 @@ Data is split by website **domain** between train and validation. The browser re
 
 The gate2 configuration reserves 32 decoder queries for at most 24 targets. Query count, token positions and letterbox geometry form an explicit model contract. **Checkpoints trained under previous contracts (e.g. 20 queries or stretched-image/incorrect box labels) cannot be assumed compatible. Retrain Gate 2 and evaluate on unseen domains before claiming it works.**
 
+## Streaming output contract
+
+The runtime's MobileNet ImageNet head is **whole-image classification**; it does not predict per-object coordinates. Predictions are exported as `image_labels` with `scope: whole_image`, not as spatial `entities`. Untrained token updates no longer fabricate bounding boxes. Until a validated object-localization head is trained and integrated, `entities` can be empty even on a clearly populated image. Existing integrations that treated classifier labels as objects must read `image_labels` explicitly.
+
 ## Evidence and limitations
 
-The contract tests check tensor shapes, gradient propagation, query capacity and consistent image/box geometry. They **do not** establish real-world recognition accuracy, UI semantic understanding, reading/OCR quality, video frame rate, model size or generalization. Production readiness requires reproducible runs on held-out scenes with published precision/recall/IoU, runtime latency, memory and checkpoint provenance.
+The contract tests check tensor shapes, gradient propagation, query capacity, consistent image/box geometry, CPU keyframes and camera-motion transforms. A successful CI run is **not** evidence of useful detection accuracy. They **do not** establish real-world recognition accuracy, UI semantic understanding, reading/OCR quality, video frame rate, model size or generalization. Production readiness requires reproducible runs on held-out scenes with published precision/recall/IoU, runtime latency, memory and checkpoint provenance.
 
 Training data and large checkpoints are not committed to this repository. Reports, weights and benchmarks must be generated on the target hardware.
