@@ -27,7 +27,8 @@ def _cache_hash(config: dict) -> str:
         "scroll_fractions": config.get("scroll_fractions", []),
         "max_objects": config.get("max_objects", 24),
         # DOM filter logic version - bump when extract_dom_elements/filter_meaningful_elements changes
-        "dom_filter_version": 2,
+        "dom_filter_version": 3,
+        "clip_transform_version": 1,
     }
     raw = json.dumps(relevant, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode()).hexdigest()[:20]
@@ -37,7 +38,7 @@ def build_teacher_cache(config: dict, device: str = "cpu",
                         cache_path: str = "artifacts/gate2_teacher_cache.pt") -> dict:
     path = Path(cache_path)
     expected_hash = _cache_hash(config)
-    if path.exists():
+    if path.exists() and not bool(config.get("force_browser_dataset", False)):
         cache = torch.load(path, map_location="cpu", weights_only=False)
         if cache.get("config_hash") == expected_hash:
             return cache
@@ -100,23 +101,36 @@ def build_teacher_cache(config: dict, device: str = "cpu",
     return cache
 
 
-def _resize_with_padding(image: Image.Image, target_size: tuple) -> Image.Image:
-    """Resize maintaining aspect ratio with center padding to target size."""
-    target_h, target_w = target_size
+def _resize_with_padding(image: Image.Image, target_size: tuple):
+    """Return the letterboxed image and its integer pixel-space geometry."""
+    target_h, target_w = map(int, target_size)
     orig_w, orig_h = image.size
-    
+    if min(target_h, target_w, orig_h, orig_w) <= 0:
+        raise ValueError("Image and target dimensions must be positive")
+
     scale = min(target_w / orig_w, target_h / orig_h)
-    new_w = int(orig_w * scale)
-    new_h = int(orig_h * scale)
-    
-    image = image.resize((new_w, new_h), Image.Resampling.BILINEAR)
-    
-    padded = Image.new('RGB', (target_w, target_h), (128, 128, 128))
+    new_w = max(1, min(target_w, int(orig_w * scale)))
+    new_h = max(1, min(target_h, int(orig_h * scale)))
+    resized = image.resize((new_w, new_h), Image.Resampling.BILINEAR)
+
+    padded = Image.new("RGB", (target_w, target_h), (128, 128, 128))
     left = (target_w - new_w) // 2
     top = (target_h - new_h) // 2
-    padded.paste(image, (left, top))
-    
-    return padded
+    padded.paste(resized, (left, top))
+    return padded, (left, top, new_w, new_h)
+
+
+def _box_to_letterbox(box: list, geometry: tuple, target_size: tuple) -> list:
+    """Map source-image normalized xyxy to padded-image normalized xyxy."""
+    left, top, new_w, new_h = geometry
+    target_h, target_w = target_size
+    x1, y1, x2, y2 = box
+    return [
+        (left + x1 * new_w) / target_w,
+        (top + y1 * new_h) / target_h,
+        (left + x2 * new_w) / target_w,
+        (top + y2 * new_h) / target_h,
+    ]
 
 
 def _style_vector(style: dict) -> list:
@@ -158,12 +172,12 @@ class CachedGate2Dataset(torch.utils.data.Dataset):
         elems = target["ui_elements"][:self.max_objects]
 
         # Resize with aspect ratio preservation + padding
-        padded = _resize_with_padding(image, self.target_size)
-        
+        padded, geometry = _resize_with_padding(image, self.target_size)
+
         student_tensor = self.student_transform(padded)
         raw_tensor = self.raw_transform(padded)
 
-        boxes = [e["bbox"] for e in elems]
+        boxes = [_box_to_letterbox(e["bbox"], geometry, self.target_size) for e in elems]
         labels = [int(e["class_id"]) for e in elems]
         styles = [_style_vector(e.get("style", {})) for e in elems]
 
