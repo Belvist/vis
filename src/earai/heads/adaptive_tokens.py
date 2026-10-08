@@ -67,8 +67,8 @@ class TokenLearner(nn.Module):
         attn_weights_2d = attn_weights.view(B, self.num_tokens, H, W)
         
         # Create coordinate grids
-        y_coords = torch.arange(H, device=x.device, dtype=torch.float32) / (H - 1)
-        x_coords = torch.arange(W, device=x.device, dtype=torch.float32) / (W - 1)
+        y_coords = torch.linspace(0, 1, H, device=x.device, dtype=attn_weights.dtype)
+        x_coords = torch.linspace(0, 1, W, device=x.device, dtype=attn_weights.dtype)
         yy, xx = torch.meshgrid(y_coords, x_coords, indexing='ij')  # [H, W]
         
         # Compute centroids: weighted sum of coordinates
@@ -132,7 +132,8 @@ class MultiScaleTokenLearner(nn.Module):
         if return_attention:
             return {
                 "tokens": tokens,
-                "attention_per_scale": all_attention
+                "centroids": torch.cat([item["centroids"] for item in all_attention], dim=1),
+                "attention_per_scale": all_attention,
             }
         return tokens
 

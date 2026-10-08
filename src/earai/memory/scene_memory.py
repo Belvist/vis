@@ -72,6 +72,7 @@ class SceneMemory:
             text_regions=packet.text_regions,
             changes=changes,
             fovea_requests=packet.fovea_requests,
+            image_labels=packet.image_labels,
             processing_time_ms=packet.processing_time_ms,
             inference_mode=packet.inference_mode,
             peripheral_resolution=packet.peripheral_resolution

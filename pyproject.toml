@@ -24,12 +24,12 @@ screen = ["mss"]
 gate1 = [
     "scipy>=1.10",
     "pycocotools>=2.0",
-    "git+https://github.com/openai/CLIP.git",
+    "clip @ git+https://github.com/openai/CLIP.git",
 ]
 gate2 = [
     "playwright>=1.40",
     "scipy>=1.10",
-    "git+https://github.com/openai/CLIP.git",
+    "clip @ git+https://github.com/openai/CLIP.git",
     "pillow>=10.0",
 ]
 
