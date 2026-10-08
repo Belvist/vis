@@ -1,5 +1,6 @@
 """Browser-rendered Web UI dataset with DOM/CSS ground truth."""
 import asyncio
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -283,17 +284,45 @@ def _manifest_valid(samples: List[Dict], split: str, allowed_domains: set) -> bo
     if not samples:
         return False
     for sample in samples:
-        if sample.get("split") != split:
+        if sample.get("split") != split or sample.get("domain") not in allowed_domains:
             return False
-        if sample.get("domain") not in allowed_domains:
+        if not Path(sample.get("image_path", "")).is_file():
             return False
         elems = sample.get("ui_elements")
         if not isinstance(elems, list) or not elems:
             return False
-        first = elems[0]
-        if "element_id" not in first or "parent_id" not in first:
+        if not all("element_id" in e and "parent_id" in e for e in elems):
             return False
     return True
+
+
+def _manifest_signature(urls: list, viewports: list, scroll_fractions: list,
+                        max_objects: int) -> str:
+    settings = {
+        "urls": urls,
+        "viewports": viewports,
+        "scroll_fractions": scroll_fractions,
+        "max_objects": max_objects,
+        "dom_filter_version": 3,
+    }
+    data = json.dumps(settings, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(data).hexdigest()
+
+
+def _manifest_matches(root: Path, split: str, signature: str) -> bool:
+    path = root / f"manifest_{split}_meta.json"
+    if not path.is_file():
+        return False
+    try:
+        with path.open() as f:
+            return json.load(f).get("signature") == signature
+    except (OSError, ValueError):
+        return False
+
+
+def _save_manifest_signature(root: Path, split: str, signature: str) -> None:
+    with (root / f"manifest_{split}_meta.json").open("w") as f:
+        json.dump({"signature": signature}, f, indent=2)
 
 
 def create_web_ui_dataset(config: dict, force_regenerate: bool = False) -> List[Dict]:
@@ -320,20 +349,26 @@ def create_web_ui_dataset(config: dict, force_regenerate: bool = False) -> List[
 
     train_allowed = set(train_domains)
     val_allowed = set(val_domains)
+    train_signature = _manifest_signature(train_urls, viewports, scroll_fractions, max_objects)
+    val_signature = _manifest_signature(val_urls, viewports, scroll_fractions, max_objects)
 
     train = _load_manifest(train_manifest) if train_manifest.exists() else []
-    if force_regenerate or not _manifest_valid(train, "train", train_allowed):
+    if (force_regenerate or not _manifest_matches(root, "train", train_signature)
+            or not _manifest_valid(train, "train", train_allowed)):
         train = asyncio.run(generate_dataset_from_urls(
             train_urls, str(root), viewports, scroll_fractions, "train",
             max_objects=max_objects
         ))
+        _save_manifest_signature(root, "train", train_signature)
 
     val = _load_manifest(val_manifest) if val_manifest.exists() else []
-    if force_regenerate or not _manifest_valid(val, "val", val_allowed):
+    if (force_regenerate or not _manifest_matches(root, "val", val_signature)
+            or not _manifest_valid(val, "val", val_allowed)):
         val = asyncio.run(generate_dataset_from_urls(
             val_urls, str(root), viewports, scroll_fractions, "val",
             max_objects=max_objects
         ))
+        _save_manifest_signature(root, "val", val_signature)
 
     with open(root / "train_domains.json", "w") as f:
         json.dump(train_domains, f, indent=2)
