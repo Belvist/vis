@@ -15,8 +15,12 @@ class Gate2Student(nn.Module):
         self.config = earai_config
         self.train_config = train_config
         self.num_tokens = int(train_config.get("num_scene_tokens", 32))
-        if self.num_tokens < 4:
-            raise ValueError("num_scene_tokens must be >= 4")
+        max_objects = int(train_config.get("max_objects", 24))
+        if self.num_tokens <= max_objects:
+            raise ValueError(
+                f"num_scene_tokens ({self.num_tokens}) must exceed max_objects ({max_objects}) "
+                "to reserve queries for background predictions"
+            )
 
         self.backbone = create_backbone(self.config)
 
@@ -48,12 +52,14 @@ class Gate2Student(nn.Module):
         ]
         token_result = self.token_pooler(features, return_attention=True)
         tokens = token_result["tokens"]
-        centroids = token_result.get("centroids")  # [B, num_tokens, 2]
+        centroids = token_result["centroids"]  # [B, num_tokens, 2]
         if tokens.shape[1] != self.num_tokens:
             raise RuntimeError(
                 f"Gate2 token contract broken: expected {self.num_tokens}, got {tokens.shape[1]}"
             )
-        return {"tokens": tokens, "centroids": centroids, **self.decoder(tokens)}
+        if centroids.shape != (x.shape[0], self.num_tokens, 2):
+            raise RuntimeError(f"Gate2 invalid centroid shape: {tuple(centroids.shape)}")
+        return {"tokens": tokens, "centroids": centroids, **self.decoder(tokens, centroids=centroids)}
 
 
 def create_gate2_student(config: dict) -> nn.Module:
