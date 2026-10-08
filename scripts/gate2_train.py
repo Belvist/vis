@@ -62,7 +62,7 @@ def _mean(values, missing=1e9):
     return float(np.mean(values)) if values else float(missing)
 
 
-def compute_metrics(outputs, batches):
+def compute_metrics(outputs, batches, objectness_threshold=0.5):
     ious_all = []
     tp = fp = fn = 0
     class_ok = class_n = 0
@@ -78,7 +78,7 @@ def compute_metrics(outputs, batches):
         pred_hier_all = out["hierarchy"]
 
         for b in range(pred_boxes_all.shape[0]):
-            active = torch.nonzero(pred_obj_all[b] >= 0.5, as_tuple=False).flatten()
+            active = torch.nonzero(pred_obj_all[b] >= objectness_threshold, as_tuple=False).flatten()
             gt_boxes = batch["boxes"][b].to(pred_boxes_all.device)
             gt_labels = batch["labels"][b].to(pred_boxes_all.device)
             gt_styles = batch["styles"][b].to(pred_boxes_all.device)
@@ -171,6 +171,7 @@ def compute_metrics(outputs, batches):
         "parent_relation_accuracy": parent_ok / max(parent_n, 1),
         "parent_relations_evaluated": parent_n,
         "tp": tp, "fp": fp, "fn": fn,
+        "objectness_threshold": float(objectness_threshold),
     }
 
 
